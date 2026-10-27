@@ -2,6 +2,7 @@
 //! the two roles on top of them, receiving ([`inbound`]) and sending
 //! ([`outbound`]).
 
+pub mod ble;
 pub mod conn;
 pub mod endpoint;
 pub mod files;

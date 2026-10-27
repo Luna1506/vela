@@ -3,9 +3,10 @@
 //! functions) and reads commands as JSON lines from stdin ([`Cmd`]); logs go
 //! to stderr. Listens on `quickshare.port` and announces itself over mDNS;
 //! every incoming connection runs on its own thread, so several offers can
-//! wait at once. Ends when stdin closes or on SIGTERM/SIGINT: the
-//! announcement is withdrawn, the search stopped and running transfers are
-//! cancelled (which removes their partial files).
+//! wait at once. While searching, a BLE beacon makes phones show up. Ends
+//! when stdin closes or on SIGTERM/SIGINT: the announcement is withdrawn, the
+//! search and the beacon stopped and running transfers are cancelled (which
+//! removes their partial files).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -25,7 +26,7 @@ use serde_json::{Value, json};
 
 use super::endpoint::{DeviceKind, EndpointInfo, SERVICE_TYPE, new_endpoint_id};
 use super::mdns::{self, Advertisement, Peer, PeerEvent};
-use super::{Decision, Event, Offer, OfferText, Outcome, files, inbound, outbound};
+use super::{Decision, Event, Offer, OfferText, Outcome, ble, files, inbound, outbound};
 use crate::config;
 
 /// How long ending waits for transfers to wind down.
@@ -345,6 +346,8 @@ struct Options {
     mdns: bool,
     /// The `[quickshare]` settings, read at the start and on `reload`.
     load: Box<dyn Fn() -> config::Quickshare + Send>,
+    /// Whether the BLE beacon can run, asked at the start and on `reload`.
+    probe_ble: Box<dyn Fn() -> bool + Send>,
 }
 
 struct Server<'a, W: Write> {
@@ -353,6 +356,11 @@ struct Server<'a, W: Write> {
     connected: bool,
     tx: mpsc::Sender<Msg>,
     load: Box<dyn Fn() -> config::Quickshare + Send>,
+    probe_ble: Box<dyn Fn() -> bool + Send>,
+    /// The BLE beacon can run, as `hello` says.
+    ble: bool,
+    /// On the air while searching.
+    beacon: Option<ble::Beacon>,
     /// Our endpoint id, for this run.
     id: [u8; 4],
     name: String,
@@ -380,8 +388,20 @@ pub fn run() -> anyhow::Result<()> {
     let opts = Options {
         mdns: true,
         load: Box::new(|| load_config().quickshare),
+        probe_ble: Box::new(probe_ble),
     };
     serve(tx, rx, &mut std::io::stdout().lock(), opts)
+}
+
+/// Whether BlueZ is there with a powered adapter (nothing is registered).
+fn probe_ble() -> bool {
+    match ble::probe() {
+        Ok(()) => true,
+        Err(e) => {
+            log::info!("quickshare: no BLE beacon: {e:#}");
+            false
+        }
+    }
 }
 
 fn load_config() -> config::Config {
@@ -412,6 +432,7 @@ impl<'a, W: Write> Server<'a, W> {
     /// this one), says hello and announces us.
     fn start(tx: mpsc::Sender<Msg>, out: &'a mut W, opts: Options) -> anyhow::Result<Self> {
         let settings = (opts.load)();
+        let ble = (opts.probe_ble)();
         let listener = match Listener::bind(settings.port, tx.clone()) {
             Ok(l) => l,
             Err(e) => {
@@ -425,6 +446,9 @@ impl<'a, W: Write> Server<'a, W> {
             connected: true,
             tx,
             load: opts.load,
+            probe_ble: opts.probe_ble,
+            ble,
+            beacon: None,
             id: new_endpoint_id(),
             name: settings.effective_name(),
             configured_port: settings.port,
@@ -467,8 +491,8 @@ impl<'a, W: Write> Server<'a, W> {
     }
 
     fn hello(&mut self) {
-        // "ble": whether the beacon that makes phones list us can run (BLE comes later).
-        let hello = json!({ "type": "hello", "name": self.name, "port": self.listener.port, "ble": false });
+        // "ble": whether the beacon that makes phones list us can run.
+        let hello = json!({ "type": "hello", "name": self.name, "port": self.listener.port, "ble": self.ble });
         self.emit(&hello);
     }
 
@@ -722,15 +746,36 @@ impl<'a, W: Write> Server<'a, W> {
                     });
                     self.search = Some(search);
                     log::info!("quickshare: looking for devices");
+                    self.start_beacon();
                 }
                 Err(e) => self.error(format!("{e:#}"), json!({})),
             }
         } else if !on && self.search.take().is_some() {
             let _ = daemon.stop_browse(SERVICE_TYPE);
             self.peers.clear();
+            self.beacon = None;
             log::info!("quickshare: stopped looking for devices");
         }
         self.devices();
+    }
+
+    /// Without the beacon phones may not show up; the shell explains that
+    /// from `hello`, so a failure is no error line.
+    fn start_beacon(&mut self) {
+        match ble::start() {
+            Ok(beacon) => {
+                self.beacon = Some(beacon);
+                if !self.ble {
+                    self.ble = true;
+                    self.hello();
+                }
+            }
+            Err(e) => {
+                log::warn!("quickshare: no BLE beacon, phones may not show up: {e:#}");
+                self.ble = false;
+                self.hello();
+            }
+        }
     }
 
     fn peer(&mut self, e: PeerEvent) {
@@ -774,13 +819,15 @@ impl<'a, W: Write> Server<'a, W> {
             log::info!("quickshare: now {:?} on port {}", self.name, self.listener.port);
             self.advertise();
         }
+        self.ble = (self.probe_ble)();
         self.hello();
     }
 
-    /// Withdraws the announcement, stops searching and listening, cancels
-    /// every transfer and waits a little for them to end.
+    /// Withdraws the announcement, stops searching, the beacon and listening,
+    /// cancels every transfer and waits a little for them to end.
     fn shutdown(mut self, rx: &mpsc::Receiver<Msg>) {
         self.advertisement = None;
+        self.beacon = None;
         if let (Some(daemon), Some(_)) = (&self.daemon, self.search.take()) {
             let _ = daemon.stop_browse(SERVICE_TYPE);
         }
@@ -1031,11 +1078,18 @@ mod tests {
     }
 
     fn start(port: u16) -> Running {
+        start_with_ble(port, Box::new(|| false))
+    }
+
+    /// Like [`start`], with `probe_ble` saying whether BLE can run (the
+    /// host's Bluetooth is never asked).
+    fn start_with_ble(port: u16, probe_ble: Box<dyn Fn() -> bool + Send>) -> Running {
         let (tx, rx) = mpsc::channel();
         let (ltx, lines) = mpsc::channel();
         let opts = Options {
             mdns: false,
             load: Box::new(move || config::Quickshare { name: "test-pc".into(), port }),
+            probe_ble,
         };
         let serve_tx = tx.clone();
         let thread = std::thread::spawn(move || serve(serve_tx, rx, &mut Lines(ltx, Vec::new()), opts));
@@ -1186,6 +1240,21 @@ mod tests {
         assert_eq!(finished(&r.lines, &b)["state"], "cancelled");
         r.thread.join().unwrap().unwrap();
         assert_eq!(outcome(second), Outcome::Cancelled);
+    }
+
+    #[test]
+    fn hello_says_whether_ble_can_run_and_reload_asks_again() {
+        let powered = Arc::new(AtomicBool::new(true));
+        let probe = powered.clone();
+        let r = start_with_ble(0, Box::new(move || probe.load(Ordering::SeqCst)));
+        assert_eq!(next(&r.lines, "hello")["ble"], true);
+
+        powered.store(false, Ordering::SeqCst);
+        r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
+        assert_eq!(next(&r.lines, "hello")["ble"], false);
+
+        r.tx.send(Msg::Eof).unwrap();
+        r.thread.join().unwrap().unwrap();
     }
 
     #[test]
