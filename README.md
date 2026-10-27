@@ -168,7 +168,7 @@ this PC appears to phones, the *Send* tab lists the phones that are nearby.
 - **Network**: in this version the PC and the phone must be on the same Wi-Fi network, or the PC on the phone's hotspot.
 - **On the phone**: set Quick Share visibility to "Everyone" (German: "Alle") while you send to the PC or receive from it.
 - **Receiving**: a window asks about every offer. Nothing is accepted automatically. Check that the PIN shown on the PC matches the one on the phone, then choose the folder (the first one is your Downloads folder) and accept.
-- **Sending**: pick files in the *Send* tab, or run `vela quickshare send <files…>` (directories are not sent). In file managers, "Send with Quick Share" is in the context menu of Dolphin and under "Open with" in Nautilus and others (`vela-quickshare.desktop`, `share/kio/servicemenus/vela-quickshare.desktop`). Without a running control center the command prints an error.
+- **Sending**: pick files in the *Send* tab, or run `vela quickshare send <files…>` (directories are not sent). Dolphin gets "Send with Quick Share" in the right-click menu (`share/kio/servicemenus/vela-quickshare.desktop`); other file managers may list "Quick Share" under "Open with", depending on how they treat hidden entries (`vela-quickshare.desktop`). `vela quickshare send` always works. Without a running control center the command prints an error.
 - **Turning it off**: the switch in the Quick Share view. While it is off, vela runs no Quick Share process and opens no port. *Settings → Control center → Quick Share tile* hides the tile; the `quickshare` component (`./install.sh --without quickshare`) removes the feature.
 
 Quick Share needs a TCP port (47392) for the transfer and UDP 5353 for mDNS
@@ -345,7 +345,7 @@ one. Running it again changes the selection; parts you drop are removed again
 | `panel` | control center, idle, screen-share picker, updates, Pulse, Quick Share (no launcher) |
 
 Components: `launcher`, `claude`, `hyprland`, `panel`, `idle`,
-`share-picker`, `updates`, `pulse`, `quickshare` (`./install.sh --list` describes them).
+`share-picker`, `updates`, `pulse`, `quickshare` (needs `panel`) (`./install.sh --list` describes them).
 
 ```sh
 ./install.sh --profile panel -y                          # no questions

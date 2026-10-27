@@ -156,6 +156,10 @@ check "selection unchanged" key profile '"minimal"'
 
 # Quick Share alone, on top of the minimal profile, and off again.
 installed --profile minimal --with quickshare -y
+check "no panel: warned" grep -q "Quick Share needs the panel component" "$tmp/out.log"
+check "no panel: no quickshare menu entry" test ! -e "$DATA/applications/vela-quickshare.desktop"
+check "no panel: no quickshare service menu" test ! -e "$DATA/kio/servicemenus/vela-quickshare.desktop"
+installed --profile minimal --with panel,quickshare -y
 check "with: quickshare menu entry" grep -qx "Exec=$BIN/vela quickshare send %F" "$DATA/applications/vela-quickshare.desktop"
 check "with: quickshare service menu" test -x "$DATA/kio/servicemenus/vela-quickshare.desktop"
 installed --profile full --without quickshare -y

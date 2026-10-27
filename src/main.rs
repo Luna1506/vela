@@ -455,6 +455,10 @@ fn quickshare(action: &str, files: &[std::path::PathBuf]) -> ExitCode {
         }
         // The running control center takes the files (its IPC handler opens the
         // Send tab); `qs ipc` fails when no shell runs.
+        _ if !vela::components::has(vela::components::Component::Quickshare) => {
+            eprintln!("vela: quickshare send: the Quick Share component is not installed");
+            ExitCode::FAILURE
+        }
         _ => match vela::quickshare::files::send_json(files) {
             Ok(json) => run_qs(&["ipc", "call", "quickshare", "send", &json]),
             Err(e) => {
