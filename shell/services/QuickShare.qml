@@ -37,6 +37,8 @@ Singleton {
     // A transfer in one of these states is over.
     readonly property var finalStates: ["done", "rejected", "cancelled", "failed", "no-space"]
 
+    readonly property int maxFinished: 20
+
     property int nextReq: 1
     // req -> callback, for replies to dirs / mkdir / pick / stat.
     property var pending: ({})
@@ -82,12 +84,12 @@ Singleton {
     function sendTo(deviceId: string): void {
         if (pendingFiles.length === 0)
             return;
-        send({
+        if (!send({
             cmd: "send",
             device: deviceId,
             files: pendingFiles.map(f => f.path)
-        });
-        pendingFiles = [];
+        }))
+            failed(I18n.tr("Quick Share is not running"));
     }
 
     function accept(id: int, dir: string): void {
@@ -97,7 +99,6 @@ Singleton {
             id: id,
             dir: dir
         });
-        dropIncoming(id);
     }
 
     function reject(id: int): void {
@@ -105,7 +106,6 @@ Singleton {
             cmd: "reject",
             id: id
         });
-        dropIncoming(id);
     }
 
     function cancel(id: int): void {
@@ -136,7 +136,7 @@ Singleton {
     function setName(name: string): void {
         if (nameProc.running)
             return;
-        nameProc.command = [Quickshell.env("VELA_BIN") || "vela", "set", "quickshare.name", name];
+        nameProc.command = [Quickshell.env("VELA_BIN") || "vela", "set", "quickshare.name", "--", name];
         nameProc.running = true;
     }
 
@@ -154,11 +154,10 @@ Singleton {
         return I18n.tr("Visible as “%1”", name);
     }
 
+    // False when the backend is down; nothing was sent then.
     function send(cmd: var): bool {
-        if (!proc.running) {
-            failed(I18n.tr("Quick Share is not running"));
+        if (!proc.running)
             return false;
-        }
         proc.write(JSON.stringify(cmd) + "\n");
         return true;
     }
@@ -166,8 +165,12 @@ Singleton {
     function request(cmd: var, cb: var): void {
         const req = nextReq++;
         cmd.req = req;
-        if (!send(cmd))
+        if (!send(cmd)) {
+            cb({
+                error: I18n.tr("Quick Share is not running")
+            });
             return;
+        }
         const p = Object.assign({}, pending);
         p[req] = cb;
         pending = p;
@@ -239,11 +242,17 @@ Singleton {
                 incoming = incoming.concat([m]);
             break;
         case "transfer":
-            transfers = Object.assign({}, transfers, {
+            const t = Object.assign({}, transfers, {
                 [m.id]: m
             });
-            if (finalStates.includes(m.state))
+            if (finalStates.includes(m.state)) {
                 dropIncoming(m.id);
+                // Keep the newest finished ones for the UI (ids only grow).
+                const over = Object.keys(t).map(Number).filter(i => finalStates.includes(t[i].state)).sort((a, b) => a - b).slice(0, -maxFinished);
+                for (const i of over)
+                    delete t[i];
+            }
+            transfers = t;
             break;
         case "text":
             if (m.kind === "text")
@@ -256,11 +265,13 @@ Singleton {
                 settle(m.req, m);
             break;
         case "error":
+            // An error to a request goes to its callback only.
             if (m.req !== null && m.req !== undefined)
                 settle(m.req, {
                     error: m.message
                 });
-            failed(m.message);
+            else
+                failed(m.message);
             break;
         }
     }
