@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod nixos;
 pub mod paths;
 pub mod pulse;
+pub mod quickshare;
 pub mod search;
 pub mod search_terms;
 pub mod selfupdate;
