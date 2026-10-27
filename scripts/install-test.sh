@@ -60,6 +60,9 @@ check "minimal: no share picker" test ! -e "$BIN/vela-share-picker"
 check "minimal: no pulse" test ! -e "$BIN/vela-pulse"
 check "minimal: no pulse menu entry" test ! -e "$DATA/applications/vela-pulse.desktop"
 check "minimal: pulse off" key pulse false
+check "minimal: no quickshare menu entry" test ! -e "$DATA/applications/vela-quickshare.desktop"
+check "minimal: no quickshare service menu" test ! -e "$DATA/kio/servicemenus/vela-quickshare.desktop"
+check "minimal: quickshare off" key quickshare false
 check "minimal: no shell" test ! -e "$DATA/vela/shell"
 check "minimal: vela.lua" test -f "$HOME/.config/hypr/vela.lua"
 check "minimal: unit" test -f "$HOME/.config/systemd/user/vela.service"
@@ -90,6 +93,11 @@ done
 check "full: pulse menu entry" grep -qx "Exec=$BIN/vela-pulse" "$DATA/applications/vela-pulse.desktop"
 check "full: pulse icon" test -f "$DATA/icons/hicolor/scalable/apps/vela-pulse.svg"
 check "full: pulse on" key pulse true
+check "full: quickshare menu entry" grep -qx "Exec=$BIN/vela quickshare send %F" "$DATA/applications/vela-quickshare.desktop"
+check "full: quickshare service menu" grep -qx "Exec=$BIN/vela quickshare send %F" "$DATA/kio/servicemenus/vela-quickshare.desktop"
+check "full: quickshare service menu is executable" test -x "$DATA/kio/servicemenus/vela-quickshare.desktop"
+check "full: quickshare on" key quickshare true
+check "full: firewall hint" grep -q "Quick Share: open TCP 47392 and UDP 5353" "$tmp/out.log"
 check "full: no test files" sh -c "! ls '$DATA/vela/shell' | grep -q '^test-'"
 check "full: xdph.conf" grep -q "custom_picker_binary = $BIN/vela-share-picker" "$HOME/.config/hypr/xdph.conf"
 check "full: MCP registered" test -e "$HOME/.mcp-registered"
@@ -146,11 +154,22 @@ check "unknown profile fails" no ./install.sh --no-build --profile huge -y 2>/de
 check "unknown component fails" no ./install.sh --no-build --with teleport -y 2>/dev/null
 check "selection unchanged" key profile '"minimal"'
 
+# Quick Share alone, on top of the minimal profile, and off again.
+installed --profile minimal --with quickshare -y
+check "with: quickshare menu entry" grep -qx "Exec=$BIN/vela quickshare send %F" "$DATA/applications/vela-quickshare.desktop"
+check "with: quickshare service menu" test -x "$DATA/kio/servicemenus/vela-quickshare.desktop"
+installed --profile full --without quickshare -y
+check "without: quickshare menu entry removed" test ! -e "$DATA/applications/vela-quickshare.desktop"
+check "without: quickshare service menu removed" test ! -e "$DATA/kio/servicemenus/vela-quickshare.desktop"
+installed --profile full -y
+
 # Settings survive the uninstall, the rest is gone.
 mkdir -p "$XDG_CONFIG_HOME/vela" && echo '# mine' >"$XDG_CONFIG_HOME/vela/config.toml"
 ./uninstall.sh >>"$tmp/out.log" 2>&1
 check "uninstall: vela gone" test ! -e "$BIN/vela"
 check "uninstall: pulse gone" test ! -e "$BIN/vela-pulse"
+check "uninstall: quickshare menu entry gone" test ! -e "$DATA/applications/vela-quickshare.desktop"
+check "uninstall: quickshare service menu gone" test ! -e "$DATA/kio/servicemenus/vela-quickshare.desktop"
 check "uninstall: selection gone" test ! -e "$DATA/vela/components.toml"
 check "uninstall: config kept" test -f "$XDG_CONFIG_HOME/vela/config.toml"
 check "uninstall: hyprland.lua kept" test -f "$HOME/.config/hypr/hyprland.lua"

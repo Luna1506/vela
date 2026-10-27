@@ -241,6 +241,28 @@ fn link_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The argument of `vela quickshare send`: the files as a JSON array of
+/// absolute paths. A missing path, a directory (only files are sent) or a
+/// name that is not valid UTF-8 is an error naming the path.
+pub fn send_json(files: &[PathBuf]) -> Result<String, String> {
+    if files.is_empty() {
+        return Err("no files given".into());
+    }
+    let mut out = Vec::with_capacity(files.len());
+    for f in files {
+        let path = fs::canonicalize(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        if path.is_dir() {
+            return Err(format!("{}: is a directory (only files can be sent)", f.display()));
+        }
+        let text = path
+            .into_os_string()
+            .into_string()
+            .map_err(|_| format!("{}: the name is not valid UTF-8", f.display()))?;
+        out.push(text);
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -412,5 +434,33 @@ mod tests {
         assert_eq!(parse_download_dir("# XDG_DOWNLOAD_DIR=\"/x\"\n", home), None);
         assert_eq!(parse_download_dir("XDG_DOWNLOAD_DIR=\"relative\"", home), None);
         assert_eq!(parse_download_dir("", home), None);
+    }
+
+    #[test]
+    fn send_json_holds_absolute_canonical_paths() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a b.txt"), "x").unwrap();
+        fs::write(d.path().join("ü\"q.bin"), "x").unwrap();
+        let rel = d.path().join(".").join("a b.txt");
+        let json = send_json(&[rel, d.path().join("ü\"q.bin")]).unwrap();
+        let v: Vec<String> = serde_json::from_str(&json).unwrap();
+        let root = fs::canonicalize(d.path()).unwrap();
+        assert_eq!(v, [root.join("a b.txt"), root.join("ü\"q.bin")].map(|p| p.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn send_json_names_a_missing_path() {
+        let d = tempfile::tempdir().unwrap();
+        let missing = d.path().join("nope.txt");
+        let err = send_json(std::slice::from_ref(&missing)).unwrap_err();
+        assert!(err.contains(&*missing.to_string_lossy()), "{err}");
+    }
+
+    #[test]
+    fn send_json_rejects_directories_and_empty_lists() {
+        let d = tempfile::tempdir().unwrap();
+        let err = send_json(&[d.path().to_path_buf()]).unwrap_err();
+        assert!(err.contains("directory") && err.contains(&*d.path().to_string_lossy()), "{err}");
+        assert!(send_json(&[]).is_err());
     }
 }

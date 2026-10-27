@@ -19,6 +19,7 @@
   <a href="#the-launcher">Launcher</a> &nbsp;·&nbsp;
   <a href="#the-control-center">Control center</a> &nbsp;·&nbsp;
   <a href="#pulse">Pulse</a> &nbsp;·&nbsp;
+  <a href="#quick-share">Quick Share</a> &nbsp;·&nbsp;
   <a href="#hyprland-without-the-config-file">Hyprland settings</a> &nbsp;·&nbsp;
   <a href="#just-say-it">Claude</a> &nbsp;·&nbsp;
   <a href="#get-it">Install</a> &nbsp;·&nbsp;
@@ -152,6 +153,46 @@ it doesn't just show numbers, it tells you what is wrong and fixes it with one c
 </td>
 </tr>
 </table>
+
+<br>
+
+<a id="quick-share"></a>
+
+## Quick Share
+
+Send and receive files, text and links with Android and Samsung phones nearby
+(Quick Share, formerly Nearby Share). Files are sent uncompressed and saved as
+they are. A tile in the control center opens it: the *Receive* tab shows how
+this PC appears to phones, the *Send* tab lists the phones that are nearby.
+
+- **Network**: in this version the PC and the phone must be on the same Wi-Fi network, or the PC on the phone's hotspot.
+- **On the phone**: set Quick Share visibility to "Everyone" (German: "Alle") while you send to the PC or receive from it.
+- **Receiving**: a window asks about every offer. Nothing is accepted automatically. Check that the PIN shown on the PC matches the one on the phone, then choose the folder (the first one is your Downloads folder) and accept.
+- **Sending**: pick files in the *Send* tab, or run `vela quickshare send <files…>` (directories are not sent). In file managers, "Send with Quick Share" is in the context menu of Dolphin and under "Open with" in Nautilus and others (`vela-quickshare.desktop`, `share/kio/servicemenus/vela-quickshare.desktop`). Without a running control center the command prints an error.
+- **Turning it off**: the switch in the Quick Share view. While it is off, vela runs no Quick Share process and opens no port. *Settings → Control center → Quick Share tile* hides the tile; the `quickshare` component (`./install.sh --without quickshare`) removes the feature.
+
+Quick Share needs a TCP port (47392) for the transfer and UDP 5353 for mDNS
+discovery. Open them in your firewall:
+
+```sh
+# NixOS
+networking.firewall.allowedTCPPorts = [ 47392 ];
+networking.firewall.allowedUDPPorts = [ 5353 ];
+
+# ufw
+sudo ufw allow 47392/tcp && sudo ufw allow 5353/udp
+
+# firewalld
+sudo firewall-cmd --add-port=47392/tcp --add-service=mdns --permanent && sudo firewall-cmd --reload
+```
+
+The name phones see and the port are set in the `[quickshare]` section of
+[`data/config.example.toml`](data/config.example.toml) (`name`, empty = the hostname; `port`).
+
+Known limitations, found with a Samsung Galaxy S25 (One UI 9):
+
+- If *Share with Apple devices* is on in the phone's Quick Share settings, the phone looks for PCs over Bluetooth only and does not find vela yet. Turn it off.
+- Some phones announce themselves without a name; vela then lists them as "Android phone".
 
 <br>
 
@@ -301,10 +342,10 @@ one. Running it again changes the selection; parts you drop are removed again
 | `full` | everything (default) |
 | `minimal` | the launcher |
 | `launcher` | launcher, Claude Code, Hyprland settings, updates, Pulse |
-| `panel` | control center, idle, screen-share picker, updates, Pulse (no launcher) |
+| `panel` | control center, idle, screen-share picker, updates, Pulse, Quick Share (no launcher) |
 
 Components: `launcher`, `claude`, `hyprland`, `panel`, `idle`,
-`share-picker`, `updates`, `pulse` (`./install.sh --list` describes them).
+`share-picker`, `updates`, `pulse`, `quickshare` (`./install.sh --list` describes them).
 
 ```sh
 ./install.sh --profile panel -y                          # no questions
@@ -342,7 +383,8 @@ a terminal.
 | Hyprland module | `~/.config/hypr/vela.lua` |
 | control center and Pulse (QML) | `~/.local/share/vela/shell` |
 | component selection | `~/.local/share/vela/components.toml` |
-| desktop entry, icons | `~/.local/share/applications`, `~/.local/share/icons` |
+| desktop entries, icons | `~/.local/share/applications`, `~/.local/share/icons` |
+| Quick Share service menu (Dolphin) | `~/.local/share/kio/servicemenus/vela-quickshare.desktop` |
 | MCP server | registered with Claude Code, if installed |
 
 Claude Code must be installed for the Claude features (`claude` in `PATH`, or

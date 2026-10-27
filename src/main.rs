@@ -441,7 +441,7 @@ fn pulse(action: &str) -> ExitCode {
     }
 }
 
-fn quickshare(action: &str, _files: &[std::path::PathBuf]) -> ExitCode {
+fn quickshare(action: &str, files: &[std::path::PathBuf]) -> ExitCode {
     match action {
         "serve" => {
             let _life = Lifecycle::start(true);
@@ -453,11 +453,15 @@ fn quickshare(action: &str, _files: &[std::path::PathBuf]) -> ExitCode {
                 }
             }
         }
-        // Handing files to the control center comes with the file manager entries.
-        _ => {
-            eprintln!("vela: quickshare send is not available yet");
-            ExitCode::FAILURE
-        }
+        // The running control center takes the files (its IPC handler opens the
+        // Send tab); `qs ipc` fails when no shell runs.
+        _ => match vela::quickshare::files::send_json(files) {
+            Ok(json) => run_qs(&["ipc", "call", "quickshare", "send", &json]),
+            Err(e) => {
+                eprintln!("vela: quickshare send: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

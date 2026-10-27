@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Quick Share
+Name[de]=Quick Share
+Comment=Send files to phones nearby
+Comment[de]=Dateien an Handys in der Nähe senden
+Exec=vela quickshare send %F
+Icon=vela
+Terminal=false
+NoDisplay=true
+MimeType=application/octet-stream;all/allfiles;image/jpeg;image/png;image/heic;image/webp;image/gif;video/mp4;video/quicktime;video/x-matroska;audio/mpeg;audio/flac;audio/ogg;application/pdf;application/zip;text/plain;

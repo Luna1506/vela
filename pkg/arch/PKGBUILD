@@ -55,6 +55,8 @@ package() {
   install -Dm644 data/config.example.toml "$pkgdir/usr/share/vela/config.example.toml"
   install -Dm644 data/vela.desktop "$pkgdir/usr/share/applications/vela.desktop"
   install -Dm644 data/vela-pulse.desktop "$pkgdir/usr/share/applications/vela-pulse.desktop"
+  install -Dm644 data/vela-quickshare.desktop "$pkgdir/usr/share/applications/vela-quickshare.desktop"
+  install -Dm755 data/vela-quickshare-servicemenu.desktop "$pkgdir/usr/share/kio/servicemenus/vela-quickshare.desktop"
   for icon in data/icons/*.svg; do
     install -Dm644 "$icon" "$pkgdir/usr/share/icons/hicolor/scalable/apps/$(basename "$icon")"
   done

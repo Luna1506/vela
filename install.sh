@@ -308,6 +308,17 @@ else
     fi
 fi
 
+# ------------------------------------------------------------ Quick Share
+# "Send with Quick Share" in file managers: a menu entry (Nautilus, "Open
+# with") and a service menu (Dolphin; must be executable or it stays hidden).
+if has quickshare; then
+    sed "s|^Exec=vela|Exec=$BINDIR/vela|" data/vela-quickshare.desktop | install -Dm644 /dev/stdin "$DATADIR/applications/vela-quickshare.desktop"
+    sed "s|^Exec=vela|Exec=$BINDIR/vela|" data/vela-quickshare-servicemenu.desktop | install -Dm755 /dev/stdin "$DATADIR/kio/servicemenus/vela-quickshare.desktop"
+    had quickshare || say "Quick Share: open TCP 47392 and UDP 5353 in your firewall (README → Quick Share)"
+else
+    rm -f "$DATADIR/applications/vela-quickshare.desktop" "$DATADIR/kio/servicemenus/vela-quickshare.desktop"
+fi
+
 # ------------------------------------------------------------ idle
 if removed idle; then
     stop idle

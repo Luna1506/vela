@@ -10,10 +10,13 @@ nix() { command nix --extra-experimental-features 'nix-command flakes' "$@"; }
 
 nix flake check --no-build "path:$repo"
 out="$(nix build --no-link --print-out-paths "path:$repo#default")"
-for f in bin/vela bin/vela-daemon bin/vela-share-picker bin/vela-pulse share/vela/vela.lua share/vela/shell/Config.qml share/vela/shell/pulse.qml share/vela/shell/pulse/Fmt.js share/vela/shell/sharepicker/logic.js share/applications/vela.desktop share/applications/vela-pulse.desktop; do
+for f in bin/vela bin/vela-daemon bin/vela-share-picker bin/vela-pulse share/vela/vela.lua share/vela/shell/Config.qml share/vela/shell/pulse.qml share/vela/shell/pulse/Fmt.js share/vela/shell/sharepicker/logic.js share/applications/vela.desktop share/applications/vela-pulse.desktop share/applications/vela-quickshare.desktop share/kio/servicemenus/vela-quickshare.desktop; do
     [[ -e "$out/$f" ]] || { echo "FAIL: package lacks $f"; exit 1; }
 done
 "$out/bin/vela" --version
+grep -qx "Exec=$out/bin/vela quickshare send %F" "$out/share/applications/vela-quickshare.desktop" || { echo "FAIL: quickshare menu entry Exec"; exit 1; }
+grep -qx "Exec=$out/bin/vela quickshare send %F" "$out/share/kio/servicemenus/vela-quickshare.desktop" || { echo "FAIL: quickshare service menu Exec"; exit 1; }
+[[ -x "$out/share/kio/servicemenus/vela-quickshare.desktop" ]] || { echo "FAIL: quickshare service menu not executable"; exit 1; }
 # Pulse and the launcher need the host's setuid sudo, systemd tools and the
 # profiles' apps, which a user service's environment may lack.
 for w in /run/wrappers/bin /run/current-system/sw/bin /run/current-system/sw/share lxqt-openssh-askpass; do
@@ -67,6 +70,7 @@ no() { ! grep -qx -- "$2" <<<"$3" || { echo "FAIL: $1: unexpected line '$2'"; fa
 c="$(file default dataFile vela/components.toml)"
 expect "default: profile" 'profile = "custom"' "$c"
 expect "default: launcher" 'launcher = true' "$c"
+expect "default: quickshare" 'quickshare = true' "$c"
 expect "default: no pacman updates" 'updates = false' "$c"
 expect "default: no share picker" 'share_picker = false' "$c"
 [[ "$(nix eval "path:$tmp#default.config.xdg.configFile" --apply 'f: f ? "hypr/xdph.conf"')" == false ]] ||

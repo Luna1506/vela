@@ -47,6 +47,11 @@ rustPlatform.buildRustPackage {
       | install -Dm644 /dev/stdin "$out/share/applications/vela.desktop"
     sed "s|^Exec=vela-pulse|Exec=$out/bin/vela-pulse|" data/vela-pulse.desktop \
       | install -Dm644 /dev/stdin "$out/share/applications/vela-pulse.desktop"
+    sed "s|^Exec=vela|Exec=$out/bin/vela|" data/vela-quickshare.desktop \
+      | install -Dm644 /dev/stdin "$out/share/applications/vela-quickshare.desktop"
+    # Dolphin ignores service menus that are not executable.
+    sed "s|^Exec=vela|Exec=$out/bin/vela|" data/vela-quickshare-servicemenu.desktop \
+      | install -Dm755 /dev/stdin "$out/share/kio/servicemenus/vela-quickshare.desktop"
     install -Dm644 contrib/hyprland/vela.lua "$out/share/vela/vela.lua"
     (cd shell && find . -type f \( -name '*.qml' -o -name '*.js' -o -name '*.svg' \) ! -name 'test-*' \
       -exec install -Dm644 {} "$out/share/vela/shell/{}" \;)
