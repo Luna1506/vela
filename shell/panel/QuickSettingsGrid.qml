@@ -94,4 +94,17 @@ GridLayout {
         onToggled: SystemUpdates.openSettings()
         onDetailRequested: SystemUpdates.openSettings()
     }
+
+    ToggleTile {
+        Layout.fillWidth: true
+        Layout.columnSpan: 2
+        visible: Config.quickshareTile
+        icon: "share"
+        title: I18n.tr("Quick Share")
+        subtitle: QuickShare.subtitle()
+        active: QuickShare.enabled
+        hasDetail: true
+        onToggled: QuickShare.toggle()
+        onDetailRequested: ShellState.openDetail("quickshare")
+    }
 }

@@ -766,6 +766,14 @@ pub fn panel(b: &Binder) -> adw::PreferencesPage {
         |c| c.panel.updates_tile,
         |c, v| c.panel.updates_tile = v,
     ));
+    if crate::components::has(crate::components::Component::Quickshare) {
+        layout.add(&b.switch(
+            "Quick Share tile",
+            "Send and receive files with phones nearby; the tile opens Quick Share",
+            |c| c.panel.quickshare_tile,
+            |c, v| c.panel.quickshare_tile = v,
+        ));
+    }
     p.add(&layout);
 
     let behaviour = group("Behaviour", "");

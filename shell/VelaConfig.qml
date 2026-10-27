@@ -73,7 +73,13 @@ Singleton {
             claudeUsageSubtle: false,
             claudeUsageOnlyDefault: false,
             claudeUsageHidden: [],
-            updatesTile: true
+            updatesTile: true,
+            quickshareTile: false
+        })
+    // Quick Share: whether the component is installed, and the visible name.
+    property var quickshare: ({
+            available: false,
+            name: "Linux"
         })
     // Pulse, the task manager.
     property var pulse: ({
@@ -107,6 +113,8 @@ Singleton {
             panel = d.panel;
             if (d.pulse)
                 pulse = d.pulse;
+            if (d.quickshare)
+                quickshare = d.quickshare;
             loaded = true;
         } catch (e) {
             console.warn("VelaConfig: unreadable settings line:", e);

@@ -40,6 +40,9 @@ Singleton {
     readonly property bool claudeUsageOnlyDefault: vp.claudeUsageOnlyDefault
     readonly property var claudeUsageHidden: vp.claudeUsageHidden
     readonly property bool updatesTile: vp.updatesTile ?? true
+    readonly property bool quickshareTile: vp.quickshareTile ?? false
+    readonly property bool quickShareAvailable: VelaConfig.quickshare.available ?? false
+    readonly property string quickShareName: VelaConfig.quickshare.name ?? ""
     readonly property bool compactNotifications: vp.compactNotifications
 
     // Compact notifications unfold after the pointer rests this long (ms).

@@ -149,6 +149,11 @@ pub fn shell_json_for(cfg: &Config, installed: &crate::components::Installed) ->
             "claudeUsageOnlyDefault": pn.claude_usage_only_default,
             "claudeUsageHidden": pn.claude_usage_hidden,
             "updatesTile": pn.updates_tile && installed.has(Component::Updates),
+            "quickshareTile": pn.quickshare_tile && installed.has(Component::Quickshare),
+        },
+        "quickshare": {
+            "available": installed.has(Component::Quickshare),
+            "name": cfg.quickshare.effective_name(),
         },
         "pulse": {
             "smoothGraphs": cfg.pulse.smooth_graphs,
@@ -292,6 +297,24 @@ mod tests {
         assert_eq!(j["pulse"]["smoothGraphs"], true);
         assert_eq!(j["pulse"]["startPage"], "overview");
         assert_eq!(j["pulse"]["rangeSecs"], 60);
+    }
+
+    #[test]
+    fn quickshare_tile_needs_component() {
+        use crate::components::{Component, Installed};
+        let mut cfg = Config::default();
+        cfg.quickshare.name = "Desk".into();
+        let j: Value = serde_json::from_str(&shell_json_for(&cfg, &Installed::only(&[Component::Panel]))).unwrap();
+        assert_eq!(j["panel"]["quickshareTile"], false);
+        assert_eq!(j["quickshare"]["available"], false);
+        let j: Value = serde_json::from_str(&shell_json_for(&cfg, &Installed::only(&[Component::Panel, Component::Quickshare]))).unwrap();
+        assert_eq!(j["panel"]["quickshareTile"], true);
+        assert_eq!(j["quickshare"]["available"], true);
+        assert_eq!(j["quickshare"]["name"], "Desk");
+        cfg.panel.quickshare_tile = false;
+        let j: Value = serde_json::from_str(&shell_json_for(&cfg, &Installed::all())).unwrap();
+        assert_eq!(j["panel"]["quickshareTile"], false);
+        assert_eq!(j["quickshare"]["available"], true);
     }
 
     #[test]

@@ -11,6 +11,8 @@ Singleton {
 
     property alias doNotDisturb: adapter.doNotDisturb
     property alias nightLight: adapter.nightLight
+    property alias quickShare: adapter.quickShare
+    property alias quickShareDir: adapter.quickShareDir
 
     FileView {
         path: Quickshell.statePath("state.json")
@@ -28,6 +30,8 @@ Singleton {
 
             property bool doNotDisturb: false
             property bool nightLight: false
+            property bool quickShare: false
+            property string quickShareDir: ""
         }
     }
 }
