@@ -11,7 +11,7 @@ pub fn home_dir() -> PathBuf {
     env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
-fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
+pub(crate) fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
     match env::var_os(var).map(PathBuf::from) {
         Some(p) if p.is_absolute() => p,
         _ => home_dir().join(fallback),
