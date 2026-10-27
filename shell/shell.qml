@@ -9,6 +9,7 @@ import qs.services
 import qs.panel
 import qs.notifications
 import qs.osd
+import qs.quickshare
 
 ShellRoot {
     // Singletons are created lazily; these must run from the start
@@ -38,6 +39,13 @@ ShellRoot {
     Backdrop {}
 
     NotificationPopups {}
+
+    // Asks about every incoming Quick Share offer, panel open or not.
+    LazyLoader {
+        active: Config.quickShareAvailable
+
+        IncomingWindow {}
+    }
 
     WorkspaceOsd {}
 

@@ -25,6 +25,9 @@ Singleton {
     property var transfers: ({})
     // Offers waiting for a decision, oldest first; the first one is shown.
     property var incoming: []
+    // offer id -> why accepting it failed; the offer keeps waiting, so the
+    // window shows this and another folder can be chosen.
+    property var offerErrors: ({})
     // Files picked for sending: [{ path, name, size }]
     property var pendingFiles: []
     readonly property string lastDir: Persist.quickShareDir
@@ -164,8 +167,11 @@ Singleton {
         return Fmt.bytes(bytes, Qt.locale());
     }
 
+    // dir "" saves into the download folder (and takes text and links).
     function accept(id: int, dir: string): void {
-        Persist.quickShareDir = dir;
+        if (dir !== "")
+            Persist.quickShareDir = dir;
+        setOfferError(id, "");
         send({
             cmd: "accept",
             id: id,
@@ -270,6 +276,19 @@ Singleton {
     function dropIncoming(id: int): void {
         if (incoming.some(o => o.id === id))
             incoming = incoming.filter(o => o.id !== id);
+        setOfferError(id, "");
+    }
+
+    // "" clears it.
+    function setOfferError(id: int, message: string): void {
+        if (message === "" && !(id in offerErrors))
+            return;
+        const e = Object.assign({}, offerErrors);
+        if (message === "")
+            delete e[id];
+        else
+            e[id] = message;
+        offerErrors = e;
     }
 
     // Nothing of the old backend survives: its ids and requests are gone.
@@ -280,6 +299,7 @@ Singleton {
         sendQueue = [];
         sentTo = ({});
         incoming = [];
+        offerErrors = ({});
         const old = pending;
         pending = ({});
         for (const req in old)
@@ -358,11 +378,14 @@ Singleton {
                 if (i >= 0)
                     sendQueue = sendQueue.slice(0, i).concat(sendQueue.slice(i + 1));
             }
-            // An error to a request goes to its callback only.
+            // An error to a request goes to its callback only, one about a
+            // waiting offer (accepting into a missing folder) to its window.
             if (m.req !== null && m.req !== undefined)
                 settle(m.req, {
                     error: m.message
                 });
+            else if (typeof m.id === "number" && incoming.some(o => o.id === m.id))
+                setOfferError(m.id, m.message);
             else
                 failed(m.message);
             break;

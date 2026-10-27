@@ -217,6 +217,9 @@ Singleton {
         // Dashed drop zone: stroke width and dash/gap length (in strokes).
         readonly property real dropBorder: 1.5
         readonly property real dropDash: 3
+        // Window for incoming Quick Share offers, and its folder list.
+        readonly property int quickShareWindowWidth: 440
+        readonly property int folderListHeight: 220
         // Below this panel height the Claude usage section is left out.
         readonly property int claudeUsageMinPanelHeight: 800
         readonly property int usageLabelWidth: 28
