@@ -3,7 +3,7 @@
 //! them (BYTES payloads carrying `sharing.nearby.Frame`s, FILE payloads in
 //! chunks) and the keep-alive Android expects every 10 seconds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -15,6 +15,7 @@ use prost::Message;
 
 use super::frame::{MAX_FRAME, read_frame, write_frame};
 use super::proto;
+use super::proto::connections::payload_transfer_frame::control_message::EventType;
 use super::proto::connections::payload_transfer_frame::payload_chunk::Flags;
 use super::proto::connections::payload_transfer_frame::payload_header::PayloadType;
 use super::proto::connections::payload_transfer_frame::{PacketType, PayloadChunk, PayloadHeader};
@@ -32,6 +33,14 @@ pub const KEEP_ALIVE: Duration = Duration::from_millis(200);
 /// Frames the reader thread may read ahead of [`Conn::recv`]. Bounded, so a
 /// fast sender waits for the disk instead of filling memory.
 const READ_AHEAD: usize = 4;
+
+/// Upper bound on what sealing adds to an `OfflineFrame` (sequence number,
+/// padding, header with IV, signature, protobuf tags). Checked before
+/// sealing, so a frame too large to send never uses up a sequence number.
+const SEAL_OVERHEAD: usize = 256;
+
+/// Stands in for "no deadline" when `now + timeout` does not fit an `Instant`.
+const FOREVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// A transport the connection runs over. Wi-Fi LAN uses a `TcpStream`; another
 /// medium only needs its own `Link`.
@@ -61,6 +70,12 @@ pub enum Incoming {
     Sharing(proto::sharing::Frame),
     /// One chunk of a FILE payload, passed on as it arrives.
     FileChunk { payload_id: i64, offset: i64, body: Vec<u8>, last: bool },
+    /// A complete BYTES payload announced with [`Conn::expect_bytes`]
+    /// (text, for example), passed on as it is.
+    Bytes { payload_id: i64, data: Vec<u8> },
+    /// The peer cancelled a payload or gave up on it (CONTROL packet with
+    /// PAYLOAD_CANCELED or PAYLOAD_ERROR).
+    PayloadCancelled { payload_id: i64 },
     /// The peer sent a DISCONNECTION frame or closed the connection.
     Disconnected,
 }
@@ -76,6 +91,8 @@ pub struct Conn {
     next_payload_id: i64,
     /// BYTES payloads still waiting for their last chunk, by payload id.
     bytes: HashMap<i64, Vec<u8>>,
+    /// BYTES payload ids handed up raw instead of decoded as sharing frames.
+    raw: HashSet<i64>,
     closed: bool,
 }
 
@@ -105,6 +122,7 @@ impl Conn {
             // payload ids come from the Introduction, so start somewhere random.
             next_payload_id: rand::random::<i64>() & (i64::MAX >> 1),
             bytes: HashMap::new(),
+            raw: HashSet::new(),
             closed: false,
         })
     }
@@ -114,11 +132,22 @@ impl Conn {
     pub fn send_sharing(&mut self, f: &proto::sharing::Frame) -> anyhow::Result<()> {
         let id = self.next_payload_id;
         self.next_payload_id = self.next_payload_id.wrapping_add(1);
-        let body = f.encode_to_vec();
-        let total = i64::try_from(body.len())?;
-        self.send_payload(id, PayloadType::Bytes, total, 0, Some(body), false)?;
-        self.send_payload(id, PayloadType::Bytes, total, total, None, true)?;
+        self.send_bytes(id, &f.encode_to_vec())
+    }
+
+    /// Sends `data` as the BYTES payload `payload_id`, in the same two chunks
+    /// as [`Conn::send_sharing`].
+    pub fn send_bytes(&mut self, payload_id: i64, data: &[u8]) -> anyhow::Result<()> {
+        let total = i64::try_from(data.len())?;
+        self.send_payload(payload_id, PayloadType::Bytes, total, 0, Some(data.to_vec()), false)?;
+        self.send_payload(payload_id, PayloadType::Bytes, total, total, None, true)?;
         Ok(())
+    }
+
+    /// Hands the BYTES payload `payload_id` up as [`Incoming::Bytes`] instead
+    /// of decoding it as a sharing frame.
+    pub fn expect_bytes(&mut self, payload_id: i64) {
+        self.raw.insert(payload_id);
     }
 
     /// Sends one chunk of a FILE payload.
@@ -141,9 +170,19 @@ impl Conn {
     /// Waits at most `timeout` for the next payload or the end of the
     /// connection (`Ok(None)` on timeout). Meanwhile it sends a `KEEP_ALIVE`
     /// whenever nothing went out for [`KEEP_ALIVE`], answers the peer's
-    /// keep-alives and collects BYTES payloads until their last chunk.
+    /// keep-alives and collects BYTES payloads until their last chunk. An
+    /// error ends the connection: later calls return [`Incoming::Disconnected`].
     pub fn recv(&mut self, timeout: Duration) -> anyhow::Result<Option<Incoming>> {
-        let deadline = Instant::now() + timeout;
+        let result = self.recv_until(timeout);
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+
+    fn recv_until(&mut self, timeout: Duration) -> anyhow::Result<Option<Incoming>> {
+        let now = Instant::now();
+        let deadline = now.checked_add(timeout).unwrap_or_else(|| now + FOREVER);
         loop {
             if self.closed {
                 return Ok(Some(Incoming::Disconnected));
@@ -159,6 +198,11 @@ impl Conn {
                 Ok(Ok(frame)) => {
                     if let Some(incoming) = self.handle(&frame)? {
                         return Ok(Some(incoming));
+                    }
+                    // Swallowed (keep-alive, partial BYTES payload, …): a
+                    // steady stream of those must not hold `recv` past its time.
+                    if Instant::now() >= deadline {
+                        return Ok(None);
                     }
                 }
                 Ok(Err(e)) => return self.failed(e),
@@ -194,8 +238,10 @@ impl Conn {
     }
 
     fn payload(&mut self, transfer: PayloadTransferFrame) -> anyhow::Result<Option<Incoming>> {
-        if matches!(transfer.packet_type(), PacketType::Control | PacketType::PayloadAck) {
-            return Ok(None);
+        match transfer.packet_type() {
+            PacketType::PayloadAck => return Ok(None),
+            PacketType::Control => return Ok(self.control(&transfer)),
+            _ => {}
         }
         let header = transfer.payload_header.context("payload without header")?;
         let chunk = transfer.payload_chunk.context("payload without chunk")?;
@@ -212,6 +258,17 @@ impl Conn {
             })),
             PayloadType::Bytes => self.bytes_chunk(id, header.total_size(), offset, &body, last),
             other => bail!("unsupported payload type {}", other.as_str_name()),
+        }
+    }
+
+    fn control(&mut self, transfer: &PayloadTransferFrame) -> Option<Incoming> {
+        let payload_id = transfer.payload_header.as_ref()?.id?;
+        match transfer.control_message?.event() {
+            EventType::PayloadCanceled | EventType::PayloadError => {
+                self.bytes.remove(&payload_id);
+                Some(Incoming::PayloadCancelled { payload_id })
+            }
+            _ => None,
         }
     }
 
@@ -235,6 +292,9 @@ impl Conn {
             return Ok(None);
         }
         let data = self.bytes.remove(&id).unwrap_or_default();
+        if self.raw.remove(&id) {
+            return Ok(Some(Incoming::Bytes { payload_id: id, data }));
+        }
         let frame = proto::sharing::Frame::decode(data.as_slice()).context("decoding sharing frame")?;
         Ok(Some(Incoming::Sharing(frame)))
     }
@@ -288,7 +348,11 @@ impl Conn {
             version: Some(offline_frame::Version::V1 as i32),
             v1: Some(v1),
         };
-        let sealed = self.secure.seal(&frame.encode_to_vec());
+        let plain = frame.encode_to_vec();
+        if plain.len() + SEAL_OVERHEAD > MAX_FRAME {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large to send"));
+        }
+        let sealed = self.secure.seal(&plain);
         // Length prefix and message in one write, so Nagle does not hold the
         // message back behind the 4-byte prefix.
         let mut buf = Vec::with_capacity(4 + sealed.len());
@@ -310,6 +374,7 @@ impl Drop for Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quickshare::proto::connections::payload_transfer_frame::{ControlMessage, control_message};
     use crate::quickshare::proto::sharing;
     use crate::quickshare::ukey2;
     use std::net::TcpListener;
@@ -613,5 +678,158 @@ mod tests {
         send_raw(&mut s, &mut chan, bytes_payload(1, 8, 0, vec![0; 2], false));
         send_raw(&mut s, &mut chan, bytes_payload(1, 8, 4, vec![0; 2], true));
         assert!(next(&mut a).is_err());
+    }
+
+    fn control_payload(id: i64, event: control_message::EventType) -> V1Frame {
+        V1Frame {
+            r#type: Some(FrameType::PayloadTransfer as i32),
+            payload_transfer: Some(PayloadTransferFrame {
+                packet_type: Some(PacketType::Control as i32),
+                payload_header: Some(PayloadHeader {
+                    id: Some(id),
+                    r#type: Some(PayloadType::File as i32),
+                    ..Default::default()
+                }),
+                payload_chunk: None,
+                control_message: Some(ControlMessage {
+                    event: Some(event as i32),
+                    offset: Some(0),
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Keys for a `Conn` (`peer == false`) and for the other end.
+    fn fixed_keys(peer: bool) -> Keys {
+        let (a, b) = if peer { ([2; 32], [1; 32]) } else { ([1; 32], [2; 32]) };
+        let (sa, sb) = if peer { ([4; 32], [3; 32]) } else { ([3; 32], [4; 32]) };
+        Keys {
+            auth: [0; 32],
+            encrypt: a,
+            decrypt: b,
+            send_hmac: sa,
+            recv_hmac: sb,
+        }
+    }
+
+    /// A link whose peer has already sent a long run of acknowledged
+    /// keep-alives (which `recv` swallows) and then closes; writes are dropped.
+    struct Flood;
+
+    impl Flood {
+        const FRAMES: usize = 2000;
+
+        fn frames() -> Vec<u8> {
+            let mut chan = SecureChannel::new(&fixed_keys(true));
+            let frame = OfflineFrame {
+                version: Some(offline_frame::Version::V1 as i32),
+                v1: Some(V1Frame {
+                    r#type: Some(FrameType::KeepAlive as i32),
+                    keep_alive: Some(KeepAliveFrame {
+                        ack: Some(true),
+                        seq_num: None,
+                    }),
+                    ..Default::default()
+                }),
+            }
+            .encode_to_vec();
+            let mut out = Vec::new();
+            for _ in 0..Self::FRAMES {
+                write_frame(&mut out, &chan.seal(&frame)).unwrap();
+            }
+            out
+        }
+    }
+
+    impl Read for Flood {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Flood {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Link for Flood {
+        fn reader(&self) -> io::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(io::Cursor::new(Flood::frames())))
+        }
+        fn close(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn recv_keeps_its_timeout_while_swallowed_frames_keep_coming() {
+        // The reader thread reads ahead far faster than `recv` decrypts, so
+        // without a deadline check after each swallowed frame `recv` would
+        // only return once the whole run is through.
+        let mut conn = Conn::new(Box::new(Flood), &fixed_keys(false)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(conn.recv(Duration::ZERO).unwrap(), None);
+    }
+
+    #[test]
+    fn recv_takes_a_huge_timeout() {
+        let (mut a, mut b) = pair();
+        a.send_sharing(&introduction()).unwrap();
+        assert_eq!(b.recv(Duration::MAX).unwrap(), Some(Incoming::Sharing(introduction())));
+    }
+
+    #[test]
+    fn an_error_ends_the_connection() {
+        let (mut a, mut s, _) = raw_pair();
+        write_frame(&mut s, b"not a secure message").unwrap();
+        assert!(next(&mut a).is_err());
+        let start = Instant::now();
+        assert_eq!(a.recv(Duration::from_secs(1)).unwrap(), Some(Incoming::Disconnected));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn oversized_send_fails_without_breaking_the_sequence() {
+        let (mut a, mut b) = pair();
+        let body = vec![0; MAX_FRAME];
+        assert!(a.send_file_chunk(1, MAX_FRAME as i64, 0, &body, false).is_err());
+        a.send_sharing(&introduction()).unwrap();
+        assert_eq!(next(&mut b).unwrap(), Incoming::Sharing(introduction()));
+    }
+
+    #[test]
+    fn sealing_stays_within_the_overhead_bound() {
+        let mut chan = SecureChannel::new(&fixed_keys(false));
+        for len in [0, 1, 15, 16, 1000, 512 * 1024 + 100] {
+            assert!(chan.seal(&vec![7; len]).len() <= len + SEAL_OVERHEAD, "{len}");
+        }
+    }
+
+    #[test]
+    fn payload_cancel_and_error_are_surfaced() {
+        let (mut a, mut s, mut chan) = raw_pair();
+        #[allow(deprecated)]
+        send_raw(&mut s, &mut chan, control_payload(41, control_message::EventType::PayloadReceivedAck));
+        send_raw(&mut s, &mut chan, control_payload(42, control_message::EventType::PayloadCanceled));
+        send_raw(&mut s, &mut chan, control_payload(43, control_message::EventType::PayloadError));
+        assert_eq!(next(&mut a).unwrap(), Incoming::PayloadCancelled { payload_id: 42 });
+        assert_eq!(next(&mut a).unwrap(), Incoming::PayloadCancelled { payload_id: 43 });
+    }
+
+    #[test]
+    fn expected_bytes_payload_arrives_raw() {
+        let (mut a, mut b) = pair();
+        b.expect_bytes(5);
+        a.send_bytes(5, b"https://example.org").unwrap();
+        let expected = Incoming::Bytes {
+            payload_id: 5,
+            data: b"https://example.org".to_vec(),
+        };
+        assert_eq!(next(&mut b).unwrap(), expected);
     }
 }
