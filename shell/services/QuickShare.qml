@@ -17,6 +17,8 @@ Singleton {
 
     property bool connected: false
     property bool ble: false
+    // Phones that search over Bluetooth only find this PC.
+    property bool bleReceive: false
     // Visible name; the backend's answer wins over the configured one.
     property string name: Config.quickShareName
     // [{ id, name (null: announced without a name), kind }]
@@ -328,6 +330,7 @@ Singleton {
         case "hello":
             name = m.name;
             ble = !!m.ble;
+            bleReceive = !!m.bleReceive;
             const first = !connected;
             connected = true;
             if (first && discovering)

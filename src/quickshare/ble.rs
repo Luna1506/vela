@@ -17,12 +17,12 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 const SERVICE_UUID: &str = "0000fe2c-0000-1000-8000-00805f9b34fb";
 /// Where our `org.bluez.LEAdvertisement1` object lives on our connection.
 const ADV_PATH: &str = "/org/vela/quickshare/adv0";
-const BLUEZ: &str = "org.bluez";
+pub(super) const BLUEZ: &str = "org.bluez";
 const ADAPTER: &str = "org.bluez.Adapter1";
-const MANAGER: &str = "org.bluez.LEAdvertisingManager1";
+pub(super) const MANAGER: &str = "org.bluez.LEAdvertisingManager1";
 /// The longest any D-Bus call may take, so a hung bluetoothd cannot hold up
 /// serve for longer.
-const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The service data of the beacon: a fixed header, nine zero bytes and ten
 /// random ones.
@@ -94,7 +94,7 @@ fn system_bus(adv: Option<Advertisement>) -> anyhow::Result<Connection> {
 }
 
 /// The first adapter (by path) that can advertise and is powered.
-fn adapter(conn: &Connection) -> anyhow::Result<OwnedObjectPath> {
+pub(super) fn adapter(conn: &Connection) -> anyhow::Result<OwnedObjectPath> {
     type Objects = HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
     let reply = conn
         .call_method(Some(BLUEZ), "/", Some("org.freedesktop.DBus.ObjectManager"), "GetManagedObjects", &())

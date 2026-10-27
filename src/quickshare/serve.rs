@@ -3,10 +3,11 @@
 //! functions) and reads commands as JSON lines from stdin ([`Cmd`]); logs go
 //! to stderr. Listens on `quickshare.port` and announces itself over mDNS;
 //! every incoming connection runs on its own thread, so several offers can
-//! wait at once. While searching, a BLE beacon makes phones show up. Ends
-//! when stdin closes or on SIGTERM/SIGINT: the announcement is withdrawn, the
-//! search and the beacon stopped and running transfers are cancelled (which
-//! removes their partial files).
+//! wait at once. Phones that search over Bluetooth only find us through our
+//! GATT service and its advertisements. While searching, a BLE beacon makes
+//! phones show up. Ends when stdin closes or on SIGTERM/SIGINT: the
+//! announcements are withdrawn, the search and the beacon stopped and running
+//! transfers are cancelled (which removes their partial files).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -27,7 +28,7 @@ use serde_json::{Value, json};
 use super::desktop::{self, Notice};
 use super::endpoint::{DeviceKind, EndpointInfo, SERVICE_TYPE, new_endpoint_id};
 use super::mdns::{self, Advertisement, Peer, PeerEvent};
-use super::{Decision, Event, Offer, OfferText, Outcome, ble, files, inbound, outbound};
+use super::{Decision, Event, Offer, OfferText, Outcome, ble, files, gatt, inbound, outbound};
 use crate::config;
 
 /// How long ending waits for transfers to wind down.
@@ -395,9 +396,15 @@ struct Options {
     load: Box<dyn Fn() -> config::Quickshare + Send>,
     /// Whether the BLE beacon can run, asked at the start and on `reload`.
     probe_ble: Box<dyn Fn() -> bool + Send>,
+    receive_ble: ReceiveBle,
     /// Shows a notification (must not block).
     notify: Box<dyn Fn(Notice) + Send>,
 }
+
+/// Makes endpoint `id` with this info visible and connectable over
+/// Bluetooth (sending what phones do to the channel) until the returned
+/// guard is dropped: [`gatt::Receiver::start`].
+type ReceiveBle = Box<dyn Fn([u8; 4], &EndpointInfo, mpsc::Sender<gatt::Event>) -> anyhow::Result<Box<dyn Send>> + Send>;
 
 struct Server<'a, W: Write> {
     out: &'a mut W,
@@ -413,6 +420,11 @@ struct Server<'a, W: Write> {
     ble: bool,
     /// On the air while searching.
     beacon: Option<ble::Beacon>,
+    receive_ble: ReceiveBle,
+    /// Visible over Bluetooth, as `hello` says (`bleReceive`).
+    ble_receiver: Option<Box<dyn Send>>,
+    /// Where the BLE receiver sends what phones do.
+    ble_events: mpsc::Sender<gatt::Event>,
     /// Our endpoint id, for this run.
     id: [u8; 4],
     name: String,
@@ -441,6 +453,7 @@ pub fn run() -> anyhow::Result<()> {
         mdns: true,
         load: Box::new(|| load_config().quickshare),
         probe_ble: Box::new(probe_ble),
+        receive_ble: Box::new(|id, info, events| gatt::Receiver::start(id, info, events).map(|r| Box::new(r) as Box<dyn Send>)),
         notify: Box::new(desktop::notify_detached),
     };
     serve(tx, rx, &mut std::io::stdout().lock(), opts)
@@ -494,6 +507,15 @@ impl<'a, W: Write> Server<'a, W> {
                 bail!(message);
             }
         };
+        // What phones write over Bluetooth; reading it into connections
+        // comes later, until then it is only logged (by gatt).
+        let (ble_events, written) = mpsc::channel::<gatt::Event>();
+        let drained = std::thread::Builder::new()
+            .name("quickshare-ble".into())
+            .spawn(move || written.into_iter().for_each(drop));
+        if let Err(e) = drained {
+            log::warn!("quickshare: cannot read from Bluetooth: {e}");
+        }
         let mut server = Server {
             out,
             connected: true,
@@ -504,6 +526,9 @@ impl<'a, W: Write> Server<'a, W> {
             picking: false,
             ble,
             beacon: None,
+            receive_ble: opts.receive_ble,
+            ble_receiver: None,
+            ble_events,
             id: new_endpoint_id(),
             name: settings.effective_name(),
             configured_port: settings.port,
@@ -522,6 +547,7 @@ impl<'a, W: Write> Server<'a, W> {
             server.name,
             String::from_utf8_lossy(&server.id)
         );
+        server.receive_over_ble();
         server.hello();
         if opts.mdns {
             match ServiceDaemon::new() {
@@ -546,8 +572,15 @@ impl<'a, W: Write> Server<'a, W> {
     }
 
     fn hello(&mut self) {
-        // "ble": whether the beacon that makes phones list us can run.
-        let hello = json!({ "type": "hello", "name": self.name, "port": self.listener.port, "ble": self.ble });
+        // "ble": whether the beacon that makes phones list us can run;
+        // "bleReceive": whether phones searching over Bluetooth find us.
+        let hello = json!({
+            "type": "hello",
+            "name": self.name,
+            "port": self.listener.port,
+            "ble": self.ble,
+            "bleReceive": self.ble_receiver.is_some(),
+        });
         self.emit(&hello);
     }
 
@@ -555,6 +588,17 @@ impl<'a, W: Write> Server<'a, W> {
         EndpointInfo {
             kind: DeviceKind::Laptop,
             name: Some(self.name.clone()),
+        }
+    }
+
+    /// (Re)starts the BLE receiver under the current name. Without it
+    /// phones that search over Bluetooth only do not find us; the shell
+    /// explains that from `hello`, so a failure is no error line.
+    fn receive_over_ble(&mut self) {
+        self.ble_receiver = None;
+        match (self.receive_ble)(self.id, &self.me(), self.ble_events.clone()) {
+            Ok(receiver) => self.ble_receiver = Some(receiver),
+            Err(e) => log::warn!("quickshare: not visible over Bluetooth, phones searching only there won't find us: {e:#}"),
         }
     }
 
@@ -889,7 +933,8 @@ impl<'a, W: Write> Server<'a, W> {
     fn reload(&mut self) {
         let settings = (self.load)();
         let name = settings.effective_name();
-        let mut changed = name != self.name;
+        let renamed = name != self.name;
+        let mut changed = renamed;
         if settings.port != self.configured_port {
             match Listener::bind(settings.port, self.tx.clone()) {
                 Ok(l) => {
@@ -905,14 +950,19 @@ impl<'a, W: Write> Server<'a, W> {
             log::info!("quickshare: now {:?} on port {}", self.name, self.listener.port);
             self.advertise();
         }
+        // Also when Bluetooth was not there before.
+        if renamed || self.ble_receiver.is_none() {
+            self.receive_over_ble();
+        }
         self.ble = (self.probe_ble)();
         self.hello();
     }
 
-    /// Withdraws the announcement, stops searching, the beacon and listening,
-    /// cancels every transfer and waits a little for them to end.
+    /// Withdraws the announcements, stops searching, the beacon and
+    /// listening, cancels every transfer and waits a little for them to end.
     fn shutdown(mut self, rx: &mpsc::Receiver<Msg>) {
         self.advertisement = None;
+        self.ble_receiver = None;
         self.beacon = None;
         if let (Some(daemon), Some(_)) = (&self.daemon, self.search.take()) {
             let _ = daemon.stop_browse(SERVICE_TYPE);
@@ -996,8 +1046,8 @@ mod tests {
     use crate::quickshare::outbound;
     use std::fs;
     use std::net::{SocketAddr, TcpListener};
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -1209,23 +1259,31 @@ mod tests {
     }
 
     fn start(port: u16) -> Running {
-        start_with_ble(port, Box::new(|| false))
+        start_with(port, |_| {})
     }
 
-    /// Like [`start`], with `probe_ble` saying whether BLE can run (the
-    /// host's Bluetooth is never asked).
+    /// Like [`start`], with `probe_ble` saying whether BLE can run.
     fn start_with_ble(port: u16, probe_ble: Box<dyn Fn() -> bool + Send>) -> Running {
+        start_with(port, |o| o.probe_ble = probe_ble)
+    }
+
+    /// Like [`start`], with options changed by `adjust`. By default the
+    /// beacon cannot run and receiving over Bluetooth fails (the host's
+    /// Bluetooth is never asked).
+    fn start_with(port: u16, adjust: impl FnOnce(&mut Options)) -> Running {
         let (tx, rx) = mpsc::channel();
         let (ltx, lines) = mpsc::channel();
         let (ntx, notices) = mpsc::channel();
-        let opts = Options {
+        let mut opts = Options {
             mdns: false,
             load: Box::new(move || config::Quickshare { name: "test-pc".into(), port }),
-            probe_ble,
+            probe_ble: Box::new(|| false),
+            receive_ble: Box::new(|_, _, _| Err(anyhow::anyhow!("no Bluetooth in tests"))),
             notify: Box::new(move |n| {
                 let _ = ntx.send(n);
             }),
         };
+        adjust(&mut opts);
         let serve_tx = tx.clone();
         let thread = std::thread::spawn(move || serve(serve_tx, rx, &mut Lines(ltx, Vec::new()), opts));
         Running { notices, tx, lines, thread }
@@ -1283,6 +1341,7 @@ mod tests {
         let hello = next(&r.lines, "hello");
         assert_eq!(hello["name"], "test-pc");
         assert_eq!(hello["ble"], false);
+        assert_eq!(hello["bleReceive"], false);
         SocketAddr::from(([127, 0, 0, 1], hello["port"].as_u64().unwrap() as u16))
     }
 
@@ -1394,6 +1453,50 @@ mod tests {
 
         r.tx.send(Msg::Eof).unwrap();
         r.thread.join().unwrap().unwrap();
+    }
+
+    /// Counts its drops.
+    struct Guard(Arc<AtomicUsize>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn visible_over_ble_while_serving_and_under_a_new_name() {
+        let name = Arc::new(Mutex::new("test-pc".to_owned()));
+        let (started, stopped) = (Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicUsize::new(0)));
+        let (n, s, d) = (name.clone(), started.clone(), stopped.clone());
+        let r = start_with(0, move |o| {
+            o.load = Box::new(move || config::Quickshare {
+                name: n.lock().unwrap().clone(),
+                port: 0,
+            });
+            o.receive_ble = Box::new(move |id, info, _| {
+                s.lock().unwrap().push((id, info.name.clone().unwrap()));
+                Ok(Box::new(Guard(d.clone())))
+            });
+        });
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+
+        r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+        assert_eq!(started.lock().unwrap().len(), 1, "the same name keeps the receiver");
+
+        *name.lock().unwrap() = "renamed".into();
+        r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1, "the old receiver is gone");
+
+        r.tx.send(Msg::Eof).unwrap();
+        r.thread.join().unwrap().unwrap();
+        assert_eq!(stopped.load(Ordering::SeqCst), 2, "ending stops the receiver");
+        let started = started.lock().unwrap();
+        let names: Vec<&str> = started.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, ["test-pc", "renamed"]);
+        assert_eq!(started[0].0, started[1].0, "one endpoint id per run");
     }
 
     #[test]

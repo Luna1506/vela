@@ -226,6 +226,39 @@ ShellRoot {
         check(off !== null && off.page === null, "Quick Share off shows no tab");
     }
 
+    // The hint about "Share with Apple devices" only while phones searching
+    // over Bluetooth can't find this PC (`bleReceive` from `hello`).
+    function receiveHint(): void {
+        const page = create("details/QuickShareReceive", {});
+        const hint = page ? findChild(page, "appleHint") : null;
+        check(hint !== null, "the receive tab has the hint");
+        const wasConnected = QuickShare.connected;
+        for (const on of [true, false]) {
+            QuickShare.apply(JSON.stringify({
+                type: "hello",
+                name: QuickShare.name,
+                port: 47392,
+                ble: false,
+                bleReceive: on
+            }));
+            check(QuickShare.bleReceive === on, "hello sets bleReceive " + on);
+            check(hint?.visible === !on, "hint shown " + hint?.visible + " with bleReceive " + on);
+        }
+        QuickShare.connected = wasConnected;
+        page?.destroy();
+    }
+
+    function findChild(item: var, name: string): var {
+        if (item.objectName === name)
+            return item;
+        for (const c of item.children) {
+            const found = findChild(c, name);
+            if (found)
+                return found;
+        }
+        return null;
+    }
+
     // The folder browser: starts in the last folder, walks the tree, goes up
     // from a folder that is gone and makes new folders.
     function folderBrowser(): void {
@@ -551,6 +584,7 @@ ShellRoot {
         interval: 100
         onTriggered: {
             root.step(root.afterDestroy);
+            root.step(root.receiveHint);
             root.step(root.folderBrowser);
             root.step(root.incomingWindow);
             armDelay.start();

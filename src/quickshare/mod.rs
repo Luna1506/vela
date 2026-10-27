@@ -3,11 +3,13 @@
 //! ([`outbound`]).
 
 pub mod ble;
+pub mod blead;
 pub mod conn;
 pub mod desktop;
 pub mod endpoint;
 pub mod files;
 pub mod frame;
+pub mod gatt;
 pub mod inbound;
 pub mod mdns;
 pub mod outbound;
