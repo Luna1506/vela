@@ -227,6 +227,15 @@ fn pick_reply(req: Option<u64>) -> Value {
     json!({ "type": "picked", "req": req, "files": [], "error": "not available yet" })
 }
 
+/// The devices found: named ones by name, then those without a name (`null`)
+/// by endpoint id.
+fn devices_line(peers: &BTreeMap<String, Peer>) -> Value {
+    let mut list: Vec<&Peer> = peers.values().collect();
+    list.sort_by_cached_key(|p| (p.name.is_none(), p.name.as_deref().map(str::to_lowercase), p.endpoint.clone()));
+    let devices: Vec<Value> = list.iter().map(|p| json!({ "id": p.endpoint, "name": p.name, "kind": p.kind.id() })).collect();
+    json!({ "type": "devices", "devices": devices })
+}
+
 /// The TCP port phones connect to; accepted connections go to the channel.
 struct Listener {
     port: u16,
@@ -634,7 +643,8 @@ impl<'a, W: Write> Server<'a, W> {
         match self.spawn(id, move |events, cancel| outbound::send(addr, &me, own, &paths, id, events, cancel)) {
             Ok((cancel, thread)) => {
                 let mut t = Transfer::new("out", cancel, thread);
-                t.device = peer.name;
+                // The shell names a device without a name by its kind.
+                t.device = peer.name.unwrap_or_default();
                 t.total = total;
                 t.announced = true;
                 let line = t.line(id);
@@ -772,8 +782,10 @@ impl<'a, W: Write> Server<'a, W> {
             }
             Err(e) => {
                 log::warn!("quickshare: no BLE beacon, phones may not show up: {e:#}");
-                self.ble = false;
-                self.hello();
+                if self.ble {
+                    self.ble = false;
+                    self.hello();
+                }
             }
         }
     }
@@ -794,10 +806,8 @@ impl<'a, W: Write> Server<'a, W> {
     }
 
     fn devices(&mut self) {
-        let mut list: Vec<&Peer> = self.peers.values().collect();
-        list.sort_by_cached_key(|p| (p.name.to_lowercase(), p.endpoint.clone()));
-        let devices: Vec<Value> = list.iter().map(|p| json!({ "id": p.endpoint, "name": p.name, "kind": p.kind.id() })).collect();
-        self.emit(&json!({ "type": "devices", "devices": devices }));
+        let line = devices_line(&self.peers);
+        self.emit(&line);
     }
 
     fn reload(&mut self) {
@@ -1051,6 +1061,29 @@ mod tests {
         assert_eq!(r["req"], 5);
         assert_eq!(r["files"], json!([]));
         assert_ne!(r["error"], "");
+    }
+
+    #[test]
+    fn devices_lists_named_peers_first_and_nameless_ones_with_null() {
+        let peer = |endpoint: &str, name: Option<&str>| {
+            let p = mdns::Peer {
+                endpoint: endpoint.into(),
+                name: name.map(str::to_owned),
+                kind: DeviceKind::Phone,
+                addr: "192.168.0.51:53601".parse().unwrap(),
+            };
+            (p.endpoint.clone(), p)
+        };
+        let peers = BTreeMap::from([peer("VCRE", None), peer("AB12", None), peer("ZZZZ", Some("anna")), peer("CCCC", Some("Bob"))]);
+        assert_eq!(
+            devices_line(&peers),
+            json!({ "type": "devices", "devices": [
+                { "id": "ZZZZ", "name": "anna", "kind": "phone" },
+                { "id": "CCCC", "name": "Bob", "kind": "phone" },
+                { "id": "AB12", "name": null, "kind": "phone" },
+                { "id": "VCRE", "name": null, "kind": "phone" },
+            ]})
+        );
     }
 
     /// Collects the JSON lines `serve` writes.

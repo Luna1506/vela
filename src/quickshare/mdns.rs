@@ -71,7 +71,9 @@ fn txt_value(info: &EndpointInfo) -> String {
 pub struct Peer {
     /// Its endpoint id (four letters or digits).
     pub endpoint: String,
-    pub name: String,
+    /// None when it hides its name (phones do so even with visibility
+    /// "Everyone") or announces an empty one.
+    pub name: Option<String>,
     pub kind: DeviceKind,
     pub addr: SocketAddr,
 }
@@ -80,14 +82,16 @@ pub struct Peer {
 pub enum PeerEvent {
     /// Found, or its name or address changed.
     Up(Peer),
-    /// Gone or hidden, by endpoint id. May name a device never reported up.
+    /// Gone or without endpoint info, by endpoint id. May name a device never
+    /// reported up.
     Down(String),
 }
 
 /// Looks for other devices until `daemon.stop_browse(SERVICE_TYPE)` (or the
 /// receiver is dropped and the next event arrives). Our own announcement
-/// (`own`) and hidden devices are left out; IPv4 addresses on the network
-/// are preferred.
+/// (`own`) and entries whose endpoint info is missing or broken are left
+/// out; devices that hide their name are listed without one. IPv4 addresses
+/// on the network are preferred.
 pub fn browse(daemon: &ServiceDaemon, own: [u8; 4]) -> anyhow::Result<mpsc::Receiver<PeerEvent>> {
     let events = daemon.browse(SERVICE_TYPE).context("mDNS search")?;
     let (tx, rx) = mpsc::channel();
@@ -128,10 +132,10 @@ fn endpoint_of(fullname: &str, own: [u8; 4]) -> Option<String> {
 
 fn resolved(fullname: &str, txt: Option<&str>, addrs: &[SocketAddr], own: [u8; 4]) -> Option<PeerEvent> {
     let endpoint = endpoint_of(fullname, own)?;
-    let info = txt.and_then(unb64).and_then(|b| EndpointInfo::decode(&b));
-    let Some((kind, name)) = info.and_then(|i| Some((i.kind, i.name.filter(|n| !n.trim().is_empty())?))) else {
+    let Some(info) = txt.and_then(unb64).and_then(|b| EndpointInfo::decode(&b)) else {
         return Some(PeerEvent::Down(endpoint));
     };
+    let (kind, name) = (info.kind, info.name.filter(|n| !n.trim().is_empty()));
     let addr = addrs.iter().copied().min_by_key(|a| (rank(a), *a))?;
     Some(PeerEvent::Up(Peer { endpoint, name, kind, addr }))
 }
@@ -200,7 +204,7 @@ mod tests {
             got,
             Some(PeerEvent::Up(Peer {
                 endpoint: "AB12".into(),
-                name: "Galaxy S24".into(),
+                name: Some("Galaxy S24".into()),
                 kind: DeviceKind::Phone,
                 addr: "192.168.1.20:4000".parse().unwrap(),
             }))
@@ -214,15 +218,40 @@ mod tests {
         assert!(matches!(v6, Some(PeerEvent::Up(p)) if p.addr.is_ipv6()), "IPv6 if that is all there is");
     }
 
+    /// What a Galaxy S25 Ultra announced with visibility "Everyone": the
+    /// hidden bit set and no name.
     #[test]
-    fn own_entries_and_entries_without_a_name_are_ignored() {
+    fn hidden_phone_is_listed_without_name() {
+        let got = resolved(
+            &format!("I1ZDUkX8n14AAA.{SERVICE_TYPE}"),
+            Some("MtcZPx86EttsZrogwXf7V8Y"),
+            &addrs(&["192.168.0.51:53601"]),
+            *b"OWN1",
+        );
+        assert_eq!(
+            got,
+            Some(PeerEvent::Up(Peer {
+                endpoint: "VCRE".into(),
+                name: None,
+                kind: DeviceKind::Phone,
+                addr: "192.168.0.51:53601".parse().unwrap(),
+            }))
+        );
+    }
+
+    #[test]
+    fn own_entries_and_entries_without_endpoint_info_are_ignored() {
         let phone = txt(DeviceKind::Phone, Some("Galaxy"));
         let a = addrs(&["192.168.1.20:4000"]);
         assert_eq!(resolved(&fullname(b"OWN1"), Some(&phone), &a, *b"OWN1"), None);
-        // Hidden (no name), empty name, no TXT, broken TXT: gone from the
-        // list if it was there.
+        // Hidden or an empty name: listed without a name.
         let (hidden, empty) = (txt(DeviceKind::Phone, None), txt(DeviceKind::Phone, Some(" ")));
-        for t in [Some(hidden.as_str()), Some(empty.as_str()), None, Some("!!")] {
+        for t in [hidden, empty] {
+            let got = resolved(&fullname(b"AB12"), Some(&t), &a, *b"OWN1");
+            assert!(matches!(&got, Some(PeerEvent::Up(p)) if p.name.is_none() && p.endpoint == "AB12"), "{got:?}");
+        }
+        // No TXT, broken TXT: gone from the list if it was there.
+        for t in [None, Some("!!")] {
             assert_eq!(resolved(&fullname(b"AB12"), t, &a, *b"OWN1"), Some(PeerEvent::Down("AB12".into())));
         }
         assert_eq!(resolved(&fullname(b"AB12"), Some(&phone), &[], *b"OWN1"), None, "no address");
