@@ -1,5 +1,6 @@
 //! Quick Share (Nearby Share over Wi-Fi LAN): protocol types and framing.
 
+pub mod conn;
 pub mod endpoint;
 pub mod files;
 pub mod frame;
