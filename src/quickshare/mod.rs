@@ -7,9 +7,11 @@ pub mod endpoint;
 pub mod files;
 pub mod frame;
 pub mod inbound;
+pub mod mdns;
 pub mod outbound;
 pub mod proto;
 pub mod secure;
+pub mod serve;
 pub mod ukey2;
 
 use std::io::{self, Write};

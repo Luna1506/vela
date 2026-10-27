@@ -126,6 +126,8 @@ claude_usage_only_default = false
 claude_usage_hidden = []
 # Tile with the pending system updates.
 updates_tile = true
+# Quick Share tile (send and receive files with phones nearby).
+quickshare_tile = true
 
 # While you're away (`vela idle` runs hypridle with these). Minutes without input.
 [idle]
@@ -185,3 +187,12 @@ key_end = "g"
 key_restart = "r"
 key_pause = "p"
 key_efficiency = "e"
+
+[quickshare]
+# Quick Share with Android and Samsung phones on the same network.
+# The name phones show; "" = the hostname.
+name = ""
+# TCP port phones connect to. Open it in the firewall, and UDP 5353 for mDNS
+# (NixOS: networking.firewall.allowedTCPPorts = [ 47392 ] and
+# networking.firewall.allowedUDPPorts = [ 5353 ]).
+port = 47392

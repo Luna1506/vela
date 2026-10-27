@@ -24,6 +24,46 @@ pub struct Config {
     pub self_update: SelfUpdate,
     /// Pulse, the task manager (`vela pulse`).
     pub pulse: Pulse,
+    /// Quick Share with phones nearby (`vela quickshare serve`).
+    pub quickshare: Quickshare,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Quickshare {
+    /// The name phones show; empty = the hostname.
+    pub name: String,
+    /// TCP port phones connect to (open it in the firewall, with UDP 5353
+    /// for mDNS).
+    pub port: u16,
+}
+
+pub const QUICKSHARE_PORT: u16 = 47392;
+
+impl Default for Quickshare {
+    fn default() -> Self {
+        Quickshare {
+            name: String::new(),
+            port: QUICKSHARE_PORT,
+        }
+    }
+}
+
+impl Quickshare {
+    /// `name`, else the hostname, else "Linux".
+    pub fn effective_name(&self) -> String {
+        name_or_hostname(&self.name, std::fs::read_to_string("/proc/sys/kernel/hostname").ok().as_deref())
+    }
+}
+
+fn name_or_hostname(name: &str, hostname: Option<&str>) -> String {
+    [Some(name), hostname]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|n| !n.is_empty())
+        .unwrap_or("Linux")
+        .to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +338,8 @@ pub struct Panel {
     pub claude_usage_hidden: Vec<String>,
     /// Pending system updates as a tile (opens Settings → Updates).
     pub updates_tile: bool,
+    /// Quick Share as a tile (only with the quickshare component).
+    pub quickshare_tile: bool,
 }
 
 impl Default for Panel {
@@ -335,6 +377,7 @@ impl Default for Panel {
             claude_usage_only_default: false,
             claude_usage_hidden: Vec::new(),
             updates_tile: true,
+            quickshare_tile: true,
         }
     }
 }
@@ -815,6 +858,10 @@ impl Config {
         u.check_interval_hours = u.check_interval_hours.min(24 * 30);
         u.claude_workspace = u.claude_workspace.trim().to_owned();
 
+        if self.quickshare.port == 0 {
+            self.quickshare.port = QUICKSHARE_PORT;
+        }
+
         if self.claude.executable.trim().is_empty() {
             self.claude.executable = Claude::default().executable;
         }
@@ -827,7 +874,8 @@ impl Config {
     }
 
     /// Sets one value by `section.key` (e.g. `idle.suspend false`). The value
-    /// is read as JSON (numbers, booleans, arrays) or else taken as a string;
+    /// is read as JSON (numbers, booleans, arrays) or else taken as a string
+    /// (always for string settings, unless it is a JSON string);
     /// unknown keys and wrong types are refused, the result is sanitized.
     pub fn set_value(&mut self, path: &str, value: &str) -> Result<()> {
         let (section, key) = path.split_once('.').context("expected section.key")?;
@@ -836,7 +884,11 @@ impl Config {
             .get_mut(section)
             .and_then(|s| s.get_mut(key))
             .with_context(|| format!("unknown setting {path}"))?;
-        let parsed = serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_owned()));
+        let parsed = match serde_json::from_str::<serde_json::Value>(value) {
+            // A name like `42` or `true` is still a name.
+            Ok(v) if v.is_string() || !slot.is_string() => v,
+            _ => serde_json::Value::String(value.to_owned()),
+        };
         if std::mem::discriminant(slot) != std::mem::discriminant(&parsed) && !(slot.is_number() && parsed.is_number()) {
             anyhow::bail!("{path} expects a value like {slot}");
         }
@@ -1008,6 +1060,7 @@ mod tests {
         assert_eq!(cfg.panel, Panel::default());
         assert_eq!(cfg.idle, Idle::default());
         assert_eq!(cfg.pulse, Pulse::default());
+        assert_eq!(cfg.quickshare, Quickshare::default());
     }
 
     #[test]
@@ -1170,6 +1223,51 @@ mod tests {
         assert!(cfg.set_value("idle.nope", "1").is_err(), "unknown keys are refused");
         assert!(cfg.set_value("idle.suspend", "maybe").is_err(), "wrong types are refused");
         assert!(cfg.set_value("idle", "1").is_err());
+    }
+
+    #[test]
+    fn quickshare_section() {
+        let cfg = Config::default();
+        assert_eq!(cfg.quickshare.port, 47392);
+        assert_eq!(cfg.quickshare.name, "");
+        assert!(cfg.panel.quickshare_tile);
+        let cfg = Config::from_toml("[quickshare]\nname = \"Desk\"\n").unwrap();
+        assert_eq!(cfg.quickshare.name, "Desk");
+        assert_eq!(cfg.quickshare.port, 47392);
+        let cfg = Config::from_toml("[quickshare]\nport = 0\n").unwrap();
+        assert_eq!(cfg.quickshare.port, 47392, "0 would be a random port");
+    }
+
+    #[test]
+    fn quickshare_name_falls_back_to_the_hostname() {
+        assert_eq!(name_or_hostname(" Desk ", Some("luna-laptop")), "Desk");
+        assert_eq!(name_or_hostname("", Some("luna-laptop\n")), "luna-laptop");
+        assert_eq!(name_or_hostname("   ", Some("luna-laptop")), "luna-laptop");
+        assert_eq!(name_or_hostname("", Some(" \n")), "Linux");
+        assert_eq!(name_or_hostname("", None), "Linux");
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
+        let q = Quickshare {
+            name: "  ".into(),
+            ..Quickshare::default()
+        };
+        assert_eq!(q.effective_name(), name_or_hostname("", host.as_deref()));
+    }
+
+    #[test]
+    fn quickshare_name_and_port_can_be_set_by_path() {
+        let mut cfg = Config::default();
+        cfg.set_value("quickshare.name", "Luna's Laptop").unwrap();
+        assert_eq!(cfg.quickshare.name, "Luna's Laptop");
+        cfg.set_value("quickshare.name", "42").unwrap();
+        assert_eq!(cfg.quickshare.name, "42", "a name that looks like a number stays a name");
+        cfg.set_value("quickshare.name", "").unwrap();
+        assert_eq!(cfg.quickshare.name, "");
+        cfg.set_value("quickshare.port", "50000").unwrap();
+        assert_eq!(cfg.quickshare.port, 50000);
+        assert!(cfg.set_value("quickshare.port", "many").is_err());
+        assert!(cfg.set_value("quickshare.port", "70000").is_err(), "not a port");
+        cfg.set_value("panel.quickshare_tile", "false").unwrap();
+        assert!(!cfg.panel.quickshare_tile);
     }
 
     #[test]

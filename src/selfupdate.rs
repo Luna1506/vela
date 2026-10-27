@@ -486,7 +486,7 @@ mod tests {
                 "--profile",
                 "full",
                 "--with",
-                "launcher,claude,hyprland,panel,idle,updates,pulse",
+                "launcher,claude,hyprland,panel,idle,updates,pulse,quickshare",
                 "--without",
                 "share-picker",
                 "-y"
@@ -501,7 +501,7 @@ mod tests {
                 "--with",
                 "launcher",
                 "--without",
-                "claude,hyprland,panel,idle,share-picker,updates,pulse",
+                "claude,hyprland,panel,idle,share-picker,updates,pulse,quickshare",
                 "-y"
             ]
         );
@@ -512,7 +512,7 @@ mod tests {
                 "--profile",
                 "full",
                 "--with",
-                "launcher,claude,hyprland,panel,idle,share-picker,updates,pulse",
+                "launcher,claude,hyprland,panel,idle,share-picker,updates,pulse,quickshare",
                 "-y"
             ]
         );
@@ -597,7 +597,7 @@ mod tests {
         crate::update::run("vela", &steps, &dir.path().join("log"), false, &mut |_| {}).unwrap();
         assert_eq!(
             std::fs::read_to_string(&args).unwrap().trim(),
-            "--profile minimal --with launcher --without claude,hyprland,panel,idle,share-picker,updates,pulse -y"
+            "--profile minimal --with launcher --without claude,hyprland,panel,idle,share-picker,updates,pulse,quickshare -y"
         );
     }
 

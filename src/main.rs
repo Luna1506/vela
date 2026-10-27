@@ -89,6 +89,14 @@ enum Cmd {
         #[arg(default_value = "open", value_parser = ["open", "serve", "snapshot", "doctor"])]
         action: String,
     },
+    /// Quick Share with phones nearby: `serve` is the control center's
+    /// backend (JSON lines on stdin/stdout, logs on stderr).
+    Quickshare {
+        #[arg(value_parser = ["serve", "send"])]
+        action: String,
+        /// Files to send (`send`).
+        files: Vec<std::path::PathBuf>,
+    },
     /// Print which parts of vela are installed (chosen in install.sh).
     Components,
     /// Print the control center settings as JSON (used by the shell).
@@ -154,6 +162,7 @@ fn main() -> ExitCode {
             };
         }
         Cmd::Pulse { action } => return pulse(&action),
+        Cmd::Quickshare { action, files } => return quickshare(&action, &files),
         Cmd::Components => {
             print_components();
             return ExitCode::SUCCESS;
@@ -429,6 +438,26 @@ fn pulse(action: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => open_pulse(),
+    }
+}
+
+fn quickshare(action: &str, _files: &[std::path::PathBuf]) -> ExitCode {
+    match action {
+        "serve" => {
+            let _life = Lifecycle::start(true);
+            match vela::quickshare::serve::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vela: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        // Handing files to the control center comes with the file manager entries.
+        _ => {
+            eprintln!("vela: quickshare send is not available yet");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -17,3 +17,4 @@ component idle          full,panel                   Idle: dim, lock and suspend
 component share-picker  full,panel                   Screen sharing: vela's picker for xdg-desktop-portal-hyprland
 component updates       full,launcher,panel          Updates: pacman, AUR and Flatpak in Settings and the panel
 component pulse         full,launcher,panel          Pulse: task manager with apps, performance, diagnosis and services
+component quickshare    full,panel                   Quick Share: send and receive files with Android and Samsung phones nearby

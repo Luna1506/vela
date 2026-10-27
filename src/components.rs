@@ -23,10 +23,11 @@ pub enum Component {
     SharePicker,
     Updates,
     Pulse,
+    Quickshare,
 }
 
 impl Component {
-    pub const ALL: [Component; 8] = [
+    pub const ALL: [Component; 9] = [
         Component::Launcher,
         Component::Claude,
         Component::Hyprland,
@@ -35,6 +36,7 @@ impl Component {
         Component::SharePicker,
         Component::Updates,
         Component::Pulse,
+        Component::Quickshare,
     ];
 
     /// Id in the catalog and in install.sh (`--with share-picker`).
@@ -48,6 +50,7 @@ impl Component {
             Component::SharePicker => "share-picker",
             Component::Updates => "updates",
             Component::Pulse => "pulse",
+            Component::Quickshare => "quickshare",
         }
     }
 
@@ -314,6 +317,16 @@ mod tests {
             assert_eq!(Component::from_id(&c.key()), Some(c));
         }
         assert_eq!(Component::SharePicker.key(), "share_picker");
+    }
+
+    #[test]
+    fn quickshare_is_a_component_of_full_and_panel() {
+        assert_eq!(Component::from_id("quickshare"), Some(Component::Quickshare));
+        assert_eq!(Component::Quickshare.key(), "quickshare");
+        assert_eq!(Component::Quickshare.profiles(), ["full", "panel"]);
+        assert!(Component::Quickshare.description().starts_with("Quick Share:"));
+        assert!(catalog().components.iter().any(|s| s.id == "quickshare"));
+        assert!(!Installed::profile("minimal", false).has(Component::Quickshare));
     }
 
     #[test]
