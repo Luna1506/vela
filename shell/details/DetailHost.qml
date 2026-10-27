@@ -29,6 +29,8 @@ Item {
             return audioDetail;
         case "power":
             return powerDetail;
+        case "quickshare":
+            return quickShareDetail;
         default:
             return null;
         }
@@ -100,5 +102,11 @@ Item {
         id: powerDetail
 
         PowerDetail {}
+    }
+
+    Component {
+        id: quickShareDetail
+
+        QuickShareDetail {}
     }
 }

@@ -55,6 +55,8 @@ Singleton {
         readonly property color chip: root.withAlpha(tint, 0.07)
         readonly property color accentChip: root.withAlpha(primary, 0.16)
         readonly property color divider: root.withAlpha(tint, 0.10)
+        // Dashed outline of a drop zone.
+        readonly property color dropOutline: root.withAlpha(tint, 0.18)
         // Slider knob, light like GTK's in both schemes.
         readonly property color knob: root.va.light ? "#ffffff" : "#f2f2f6"
 
@@ -133,6 +135,8 @@ Singleton {
         readonly property int fast: Math.round(150 * Config.animationScale)
         readonly property int normal: Math.round(250 * Config.animationScale)
         readonly property int slow: Math.round(350 * Config.animationScale)
+        // One wave of the "visible nearby" pulse (Quick Share).
+        readonly property int pulse: Math.round(2200 * Config.animationScale)
         // Delay between items leaving one after another ("Clear all").
         readonly property int stagger: Math.round(45 * Config.animationScale)
         // At most this many items get their own stagger step.
@@ -207,6 +211,12 @@ Singleton {
         readonly property int dragDismissThreshold: 120
 
         readonly property int usageBarHeight: 6
+        // Progress bar inside a list row.
+        readonly property int progressBarWidth: 64
+        readonly property int progressBarHeight: 6
+        // Dashed drop zone: stroke width and dash/gap length (in strokes).
+        readonly property real dropBorder: 1.5
+        readonly property real dropDash: 3
         // Below this panel height the Claude usage section is left out.
         readonly property int claudeUsageMinPanelHeight: 800
         readonly property int usageLabelWidth: 28

@@ -27,17 +27,19 @@ ColumnLayout {
         }
     }
 
+    // Full width (centred text): a nested layout is only as wide as its
+    // widest child allows, and the view's fillWidth should reach it.
     StyledText {
-        Layout.alignment: Qt.AlignHCenter
+        Layout.fillWidth: true
         Layout.topMargin: Theme.spacing.xs
+        horizontalAlignment: Text.AlignHCenter
         text: root.title
         font.pixelSize: Theme.font.title
         font.weight: Theme.font.weightMedium
     }
 
     SwapText {
-        Layout.alignment: Qt.AlignHCenter
-        Layout.maximumWidth: parent.width
+        Layout.fillWidth: true
         visible: root.subtitle !== ""
         value: root.subtitle
         color: Theme.colors.textMuted

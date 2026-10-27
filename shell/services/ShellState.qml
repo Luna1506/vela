@@ -11,8 +11,10 @@ Singleton {
 
     property bool panelOpen: false
     property ShellScreen panelScreen: null
-    // "" (none), "wifi", "bluetooth" or "audio"
+    // "" (none) or one of `details`
     property string detail: ""
+    // Tab of the Quick Share view: "send" or "receive".
+    property string quickShareTab: "receive"
 
     function focusedScreen(): ShellScreen {
         const name = Hyprland.focusedMonitor?.name;
@@ -38,7 +40,7 @@ Singleton {
         panelOpen ? closePanel() : openPanel();
     }
 
-    readonly property var details: ["wifi", "bluetooth", "audio", "power"]
+    readonly property var details: ["wifi", "bluetooth", "audio", "power", "quickshare"]
 
     function openDetail(name: string): void {
         if (!details.includes(name)) {
