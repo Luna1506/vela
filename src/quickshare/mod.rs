@@ -4,6 +4,7 @@
 
 pub mod ble;
 pub mod conn;
+pub mod desktop;
 pub mod endpoint;
 pub mod files;
 pub mod frame;

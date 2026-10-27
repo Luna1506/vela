@@ -24,6 +24,7 @@ use mdns_sd::ServiceDaemon;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::desktop::{self, Notice};
 use super::endpoint::{DeviceKind, EndpointInfo, SERVICE_TYPE, new_endpoint_id};
 use super::mdns::{self, Advertisement, Peer, PeerEvent};
 use super::{Decision, Event, Offer, OfferText, Outcome, ble, files, inbound, outbound};
@@ -104,6 +105,8 @@ enum Msg {
     Ended(u64),
     /// From the search with this number.
     Peer(u64, PeerEvent),
+    /// A line a worker thread has ready (the answer to `pick`).
+    Reply(Value),
 }
 
 /// Reads commands until `input` ends; a line that is not a command is
@@ -222,9 +225,42 @@ fn stat_reply(req: Option<u64>, paths: &[PathBuf]) -> Value {
     json!({ "type": "picked", "req": req, "files": ok, "error": problems.join("; ") })
 }
 
-/// The file dialog comes with the desktop services (notifications, portal).
-fn pick_reply(req: Option<u64>) -> Value {
-    json!({ "type": "picked", "req": req, "files": [], "error": "not available yet" })
+/// The answer to `pick`: the chosen files like `stat` (none when the dialog
+/// was cancelled), or the reason there was no dialog.
+fn pick_reply(req: Option<u64>, picked: anyhow::Result<Vec<PathBuf>>) -> Value {
+    match picked {
+        Ok(paths) => stat_reply(req, &paths),
+        Err(e) => json!({ "type": "picked", "req": req, "files": [], "error": e.to_string() }),
+    }
+}
+
+/// The notification for files received into `dir`.
+fn received_notice(lang: desktop::Lang, n: usize, device: &str, dir: &str) -> Notice {
+    Notice {
+        summary: desktop::received_summary(lang, n),
+        body: format!("{device} · {dir}"),
+        action: Some((desktop::open_folder_label(lang).into(), desktop::file_uri(dir))),
+    }
+}
+
+/// The notification for received text: a link can be opened (web links
+/// only), plain text was copied by the shell.
+fn text_notice(lang: desktop::Lang, kind: &str, text: &str, device: &str) -> Notice {
+    let is_web_link = text.starts_with("https://") || text.starts_with("http://");
+    if kind == "url" {
+        let action = is_web_link.then(|| (desktop::open_label(lang).into(), text.to_owned()));
+        Notice {
+            summary: text.to_owned(),
+            body: device.to_owned(),
+            action,
+        }
+    } else {
+        Notice {
+            summary: desktop::text_copied_summary(lang, device),
+            body: desktop::preview(text, 80),
+            action: None,
+        }
+    }
 }
 
 /// The devices found: named ones by name, then those without a name (`null`)
@@ -357,6 +393,8 @@ struct Options {
     load: Box<dyn Fn() -> config::Quickshare + Send>,
     /// Whether the BLE beacon can run, asked at the start and on `reload`.
     probe_ble: Box<dyn Fn() -> bool + Send>,
+    /// Shows a notification (must not block).
+    notify: Box<dyn Fn(Notice) + Send>,
 }
 
 struct Server<'a, W: Write> {
@@ -366,6 +404,7 @@ struct Server<'a, W: Write> {
     tx: mpsc::Sender<Msg>,
     load: Box<dyn Fn() -> config::Quickshare + Send>,
     probe_ble: Box<dyn Fn() -> bool + Send>,
+    notify: Box<dyn Fn(Notice) + Send>,
     /// The BLE beacon can run, as `hello` says.
     ble: bool,
     /// On the air while searching.
@@ -398,6 +437,7 @@ pub fn run() -> anyhow::Result<()> {
         mdns: true,
         load: Box::new(|| load_config().quickshare),
         probe_ble: Box::new(probe_ble),
+        notify: Box::new(desktop::notify_detached),
     };
     serve(tx, rx, &mut std::io::stdout().lock(), opts)
 }
@@ -456,6 +496,7 @@ impl<'a, W: Write> Server<'a, W> {
             tx,
             load: opts.load,
             probe_ble: opts.probe_ble,
+            notify: opts.notify,
             ble,
             beacon: None,
             id: new_endpoint_id(),
@@ -542,6 +583,9 @@ impl<'a, W: Write> Server<'a, W> {
             Msg::Ended(id) => self.ended(id),
             Msg::Peer(search, e) if Some(search) == self.search => self.peer(e),
             Msg::Peer(..) => {}
+            Msg::Reply(v) => {
+                self.emit(&v);
+            }
         }
         self.connected
     }
@@ -573,7 +617,14 @@ impl<'a, W: Write> Server<'a, W> {
                 self.emit(&reply);
             }
             Cmd::Pick { req } => {
-                self.emit(&pick_reply(req));
+                // The dialog stays open as long as the user likes.
+                let tx = self.tx.clone();
+                let spawned = std::thread::Builder::new().name("quickshare-pick".into()).spawn(move || {
+                    let _ = tx.send(Msg::Reply(pick_reply(req, desktop::pick_files())));
+                });
+                if let Err(e) = spawned {
+                    self.emit(&pick_reply(req, Err(e.into())));
+                }
             }
             Cmd::Stat { req, files } => {
                 let reply = stat_reply(req, &files);
@@ -718,9 +769,19 @@ impl<'a, W: Write> Server<'a, W> {
                 (t.done, t.total, t.state) = (done, total, "transferring");
                 t.line(id)
             }
-            Event::Text { id, kind, text } => json!({ "type": "text", "id": id, "kind": kind, "text": text }),
+            Event::Text { id, kind, text } => {
+                if let Some(t) = self.transfers.get(&id).filter(|t| t.direction == "in") {
+                    let notice = text_notice(desktop::Lang::from_env(), kind, &text, &t.device);
+                    (self.notify)(notice);
+                }
+                json!({ "type": "text", "id": id, "kind": kind, "text": text })
+            }
             Event::Finished { id, outcome, saved } => {
                 let Some(t) = self.transfers.get_mut(&id) else { return };
+                if t.direction == "in" && outcome == Outcome::Done && !saved.is_empty() {
+                    let notice = received_notice(desktop::Lang::from_env(), saved.len(), &t.device, &t.dir);
+                    (self.notify)(notice);
+                }
                 log::info!("quickshare: {id} ended: {outcome:?}");
                 (t.state, t.error) = state_of(&outcome);
                 t.saved = saved.iter().map(|p| lossy(p)).collect();
@@ -1056,11 +1117,32 @@ mod tests {
         let error = r["error"].as_str().unwrap();
         assert!(error.contains("Neu") && error.contains("gone"), "{error}");
 
-        let r = pick_reply(Some(5));
-        assert_eq!(r["type"], "picked");
-        assert_eq!(r["req"], 5);
-        assert_eq!(r["files"], json!([]));
-        assert_ne!(r["error"], "");
+        let r = pick_reply(Some(5), Ok(vec![file.clone()]));
+        assert_eq!(r["files"], json!([{ "path": file.to_str().unwrap(), "name": "a.jpg", "size": 5 }]));
+        let r = pick_reply(Some(5), Ok(Vec::new()));
+        assert_eq!(
+            (&r["type"], &r["req"], &r["files"], &r["error"]),
+            (&json!("picked"), &json!(5), &json!([]), &json!("")),
+            "cancelled"
+        );
+        let r = pick_reply(Some(5), Err(anyhow::anyhow!(desktop::NO_DIALOG)));
+        assert_eq!((&r["files"], &r["error"]), (&json!([]), &json!(desktop::NO_DIALOG)));
+    }
+
+    #[test]
+    fn text_and_file_notices() {
+        use desktop::Lang;
+        let n = text_notice(Lang::En, "url", "https://example.org/x", "Pixel");
+        assert_eq!((n.summary.as_str(), n.body.as_str()), ("https://example.org/x", "Pixel"));
+        assert_eq!(n.action, Some(("Open".into(), "https://example.org/x".into())));
+        assert_eq!(text_notice(Lang::De, "url", "ftp://x", "Pixel").action, None, "only web links open");
+        let n = text_notice(Lang::De, "text", &"y".repeat(200), "Pixel");
+        assert_eq!(n.summary, "Text von Pixel kopiert");
+        assert_eq!(n.body.chars().count(), 80);
+        assert_eq!(n.action, None);
+        let n = received_notice(Lang::De, 3, "Pixel", "/home/a/Downloads");
+        assert_eq!((n.summary.as_str(), n.body.as_str()), ("3 Dateien empfangen", "Pixel · /home/a/Downloads"));
+        assert_eq!(n.action, Some(("Ordner öffnen".into(), "file:///home/a/Downloads".into())));
     }
 
     #[test]
@@ -1105,6 +1187,7 @@ mod tests {
     }
 
     struct Running {
+        notices: mpsc::Receiver<Notice>,
         tx: mpsc::Sender<Msg>,
         lines: mpsc::Receiver<Value>,
         thread: std::thread::JoinHandle<anyhow::Result<()>>,
@@ -1119,14 +1202,18 @@ mod tests {
     fn start_with_ble(port: u16, probe_ble: Box<dyn Fn() -> bool + Send>) -> Running {
         let (tx, rx) = mpsc::channel();
         let (ltx, lines) = mpsc::channel();
+        let (ntx, notices) = mpsc::channel();
         let opts = Options {
             mdns: false,
             load: Box::new(move || config::Quickshare { name: "test-pc".into(), port }),
             probe_ble,
+            notify: Box::new(move |n| {
+                let _ = ntx.send(n);
+            }),
         };
         let serve_tx = tx.clone();
         let thread = std::thread::spawn(move || serve(serve_tx, rx, &mut Lines(ltx, Vec::new()), opts));
-        Running { tx, lines, thread }
+        Running { notices, tx, lines, thread }
     }
 
     /// The next line of type `ty`, skipping the others.
@@ -1238,6 +1325,10 @@ mod tests {
         assert_eq!(done["saved"], json!([saved.to_str().unwrap()]));
         assert_eq!(fs::read(&saved).unwrap(), b"hello");
         assert_eq!(outcome(p), Outcome::Done);
+        let notice = r.notices.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(notice.body, format!("Galaxy S24 · {}", dest.path().display()));
+        assert_eq!(notice.action.unwrap().1, desktop::file_uri(dest.path().to_str().unwrap()));
+        assert!(r.notices.try_recv().is_err(), "one notification per transfer");
 
         r.tx.send(Msg::Eof).unwrap();
         r.thread.join().unwrap().unwrap();
