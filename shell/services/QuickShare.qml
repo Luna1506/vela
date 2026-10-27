@@ -28,6 +28,9 @@ Singleton {
     // offer id -> why accepting it failed; the offer keeps waiting, so the
     // window shows this and another folder can be chosen.
     property var offerErrors: ({})
+    // offer id -> the folder it was accepted into; it becomes the last
+    // folder once receiving starts (a refused folder must not).
+    property var acceptedDirs: ({})
     // Files picked for sending: [{ path, name, size }]
     property var pendingFiles: []
     readonly property string lastDir: Persist.quickShareDir
@@ -169,8 +172,12 @@ Singleton {
 
     // dir "" saves into the download folder (and takes text and links).
     function accept(id: int, dir: string): void {
+        const d = Object.assign({}, acceptedDirs);
         if (dir !== "")
-            Persist.quickShareDir = dir;
+            d[id] = dir;
+        else
+            delete d[id];
+        acceptedDirs = d;
         setOfferError(id, "");
         send({
             cmd: "accept",
@@ -300,6 +307,7 @@ Singleton {
         sentTo = ({});
         incoming = [];
         offerErrors = ({});
+        acceptedDirs = ({});
         const old = pending;
         pending = ({});
         for (const req in old)
@@ -342,6 +350,14 @@ Singleton {
                     [m.id]: sendQueue[0]
                 });
                 sendQueue = sendQueue.slice(1);
+            }
+            // Receiving has started: the folder was fine, remember it.
+            if (m.id in acceptedDirs && m.state !== "waiting") {
+                if (m.state === "transferring")
+                    Persist.quickShareDir = acceptedDirs[m.id];
+                const d = Object.assign({}, acceptedDirs);
+                delete d[m.id];
+                acceptedDirs = d;
             }
             const t = Object.assign({}, transfers, {
                 [m.id]: m

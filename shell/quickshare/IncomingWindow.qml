@@ -48,8 +48,11 @@ PanelWindow {
         return found;
     }
 
-    // "offer", "progress", "result" or "" (nothing to show).
-    readonly property string liveMode: outcomeId >= 0 ? "result" : runningId >= 0 ? "progress" : waitingOffers.length > 0 ? "offer" : ""
+    // "offer", "progress", "result" or "" (nothing to show). A transfer in
+    // front only runs after its offer was accepted here, so it never hides
+    // an undecided one; an outcome waits until no offer and no transfer in
+    // front is left, so it never replaces what is being decided.
+    readonly property string liveMode: runningId >= 0 ? "progress" : waitingOffers.length > 0 ? "offer" : outcomeId >= 0 ? "result" : ""
     readonly property bool shown: liveMode !== ""
     readonly property var liveOffer: liveMode === "offer" ? waitingOffers[0] : null
     readonly property int liveTransferId: liveMode === "result" ? outcomeId : liveMode === "progress" ? runningId : -1
@@ -72,7 +75,10 @@ PanelWindow {
         // A new offer: the browser opens in the last folder again.
         const fresh = offer?.id !== liveOffer.id;
         offer = liveOffer;
-        if (fresh && browser)
+        if (!fresh)
+            return;
+        disarm();
+        if (browser)
             browser.open(QuickShare.lastDir);
     }
     onLiveTransferIdChanged: {
@@ -166,6 +172,7 @@ PanelWindow {
         const eta = left < 60 ? I18n.tr("%1 s", Math.max(1, Math.round(left))) : I18n.duration(left);
         return I18n.tr("%1 of %2 · about %3 left", ...amount, eta);
     }
+    readonly property string resultTitle: I18n.tr("Not received")
     readonly property string resultText: {
         switch (transfer?.state) {
         case "no-space":
@@ -173,7 +180,8 @@ PanelWindow {
         case "failed":
             return transfer.error ? I18n.tr("The transfer failed: %1", transfer.error) : I18n.tr("The transfer failed.");
         case "cancelled":
-            return I18n.tr("The sender cancelled the transfer.");
+            // The phone, or the Wi-Fi in between.
+            return I18n.tr("The transfer was cancelled.");
         default:
             return "";
         }
@@ -201,8 +209,19 @@ PanelWindow {
 
     property ShellScreen hostScreen: null
 
+    // Keys and the decision buttons work only a moment after the window
+    // opens or shows a new offer: an Enter or Esc typed for another window
+    // must not accept or reject what just popped up.
+    property bool armed: false
+
+    function disarm(): void {
+        armed = false;
+        armTimer.restart();
+    }
+
     function open(): void {
         hostScreen = ShellState.focusedScreen();
+        disarm();
         scope.forceActiveFocus();
     }
 
@@ -237,7 +256,7 @@ PanelWindow {
     }
 
     function accept(): void {
-        if (liveMode !== "offer" || busy)
+        if (liveMode !== "offer" || busy || !armed)
             return;
         const dir = isText ? "" : browser?.dir ?? "";
         accepted = Object.assign({}, accepted, {
@@ -253,7 +272,7 @@ PanelWindow {
     }
 
     function reject(): void {
-        if (liveMode !== "offer")
+        if (liveMode !== "offer" || !armed)
             return;
         QuickShare.reject(offer.id);
         rejected = rejected.concat([offer.id]);
@@ -280,6 +299,11 @@ PanelWindow {
     }
 
     function handleKey(event: var): void {
+        // Held keys and keys right after opening are swallowed.
+        if (event.isAutoRepeat || !armed) {
+            event.accepted = shown;
+            return;
+        }
         const enter = event.key === Qt.Key_Return || event.key === Qt.Key_Enter;
         const esc = event.key === Qt.Key_Escape;
         if (liveMode === "offer" && enter)
@@ -293,6 +317,13 @@ PanelWindow {
         else
             return;
         event.accepted = true;
+    }
+
+    Timer {
+        id: armTimer
+
+        interval: Theme.anim.armDelay
+        onTriggered: root.armed = true
     }
 
     Connections {
@@ -461,13 +492,14 @@ PanelWindow {
 
                     PillButton {
                         text: I18n.tr("Reject")
+                        enabled: root.armed
                         onClicked: root.reject()
                     }
 
                     PillButton {
                         style: "filled"
                         text: I18n.tr("Accept")
-                        enabled: !root.busy
+                        enabled: root.armed && !root.busy
                         onClicked: root.accept()
                     }
                 }
@@ -490,14 +522,14 @@ PanelWindow {
 
                         StyledText {
                             Layout.fillWidth: true
-                            text: root.progressTitle
+                            text: root.mode === "result" ? root.resultTitle : root.progressTitle
                             font.weight: Theme.font.weightMedium
                         }
 
                         StyledText {
                             Layout.fillWidth: true
-                            visible: root.mode === "progress"
-                            text: root.progressText
+                            // Who it was from, or how far it got.
+                            text: root.mode === "result" ? QuickShare.deviceName(root.transferOffer?.device, root.transferOffer?.kind ?? "") : root.progressText
                             color: Theme.colors.textMuted
                             font.pixelSize: Theme.font.small
                         }

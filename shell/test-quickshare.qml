@@ -36,8 +36,8 @@ ShellRoot {
         "New folder", "Folder name", "Already exists", "Invalid name", "No subfolders", "Saving to %1",
         "“%1” can't be opened – showing the folder above.",
         // Progress and outcome
-        "Receiving from %1", "%1 of %2", "%1 of %2 · about %3 left", "%1 s", "%1 min", "In the background", "Close",
-        "Not enough free space in this folder.", "The transfer failed.", "The transfer failed: %1", "The sender cancelled the transfer."
+        "Receiving from %1", "%1 of %2", "%1 of %2 · about %3 left", "%1 s", "%1 min", "%1 h %2 min", "In the background", "Close",
+        "Not received", "Not enough free space in this folder.", "The transfer failed.", "The transfer failed: %1", "The transfer was cancelled."
     ]
 
     property var failures: []
@@ -122,10 +122,11 @@ ShellRoot {
         QuickShare.apply(inLine(id, "waiting", 0, ""));
     }
 
-    function key(target: var, k: int): bool {
+    function key(target: var, k: int, repeat: bool): bool {
         const event = {
             key: k,
             modifiers: Qt.NoModifier,
+            isAutoRepeat: repeat === true,
             accepted: false
         };
         target.handleKey(event);
@@ -367,11 +368,51 @@ ShellRoot {
             error: ""
         });
 
-        // Enter accepts into the open folder; the backend says it can't.
         win.browser?.open(korea + "/Busan");
+
+        // A key that was meant for another window decides nothing.
+        check(!win.armed, "not armed right after the offer appears");
+        check(key(win, Qt.Key_Return) && !(11 in win.accepted), "Enter right after the offer appears does nothing");
+        check(key(win, Qt.Key_Escape) && win.offer?.id === 11 && !win.rejected.includes(11), "Esc right after the offer appears does nothing");
+        win.accept();
+        check(!(11 in win.accepted), "the Accept button waits for the delay too");
+    }
+
+    // Lets a new offer's keys and buttons work without waiting the delay
+    // (the first offer above waits for real).
+    function ready(): void {
+        check(!win.armed, "a new offer waits before taking keys");
+        win.armed = true;
+    }
+
+    // The same window, after the arming delay.
+    function incomingWindowArmed(): void {
+        if (!win)
+            return;
+        const korea = home + "/Bilder/Korea";
+        const photos = [
+            {
+                name: "IMG_1.jpg",
+                size: 4000000,
+                mime: "image/jpeg"
+            },
+            {
+                name: "IMG_2.jpg",
+                size: 4000000,
+                mime: "image/jpeg"
+            },
+            {
+                name: "clip.mp4",
+                size: 184000000,
+                mime: "video/mp4"
+            }
+        ];
+        check(win.armed, "keys work after the delay");
+        check(key(win, Qt.Key_Return, true) && !(11 in win.accepted), "an auto-repeated Enter does nothing");
+
+        // Enter accepts into the open folder; the backend says it can't.
         check(key(win, Qt.Key_Return), "Enter is handled");
         check(win.accepted[11]?.dir === korea + "/Busan", "Enter accepts into the open folder: " + win.accepted[11]?.dir);
-        check(QuickShare.lastDir === korea + "/Busan", "the folder is remembered: " + QuickShare.lastDir);
         check(win.mode === "offer" && win.busy, "waiting for the backend after accepting");
         QuickShare.apply(JSON.stringify({
             type: "error",
@@ -386,12 +427,16 @@ ShellRoot {
             message: "disk on fire"
         }));
         check(win.offerError === I18n.tr("Cannot save here: %1", "disk on fire"), "another error as it comes: " + win.offerError);
-        win.browser?.open(korea);
+        check(QuickShare.lastDir === korea, "a refused folder doesn't become the last one: " + QuickShare.lastDir);
+        win.browser?.open(korea + "/Campus");
         win.accept();
         check(QuickShare.offerErrors[11] === undefined && win.offerError === "", "accepting again clears the error");
 
         // The backend starts receiving: progress in the same window.
-        QuickShare.apply(inLine(11, "transferring", 0, ""));
+        QuickShare.apply(JSON.stringify(Object.assign(JSON.parse(inLine(11, "transferring", 0, "")), {
+            dir: korea + "/Campus"
+        })));
+        check(QuickShare.lastDir === korea + "/Campus", "receiving makes the folder the last one: " + QuickShare.lastDir);
         check(win.mode === "progress", "accepted: the progress is shown: " + win.mode);
         check(win.progressTitle === I18n.tr("Receiving from %1", "Galaxy S24"), "progress title: " + win.progressTitle);
         QuickShare.apply(inLine(11, "transferring", 96468992, ""));
@@ -406,6 +451,7 @@ ShellRoot {
             title: "https://example.org"
         });
         check(win.shown && win.mode === "offer", "a new offer opens the window again");
+        ready();
         check(win.title === I18n.tr("%1 wants to send a link", I18n.tr("Android phone")), "a link from a nameless phone: " + win.title);
         check(win.browser === null, "no folder browser for a link");
         offer(13, "Pixel", "phone", [], {
@@ -415,6 +461,7 @@ ShellRoot {
         check(win.offer?.id === 12, "the oldest offer comes first");
         check(key(win, Qt.Key_Escape), "Esc is handled");
         check(win.offer?.id === 13, "after rejecting, the next offer in the queue");
+        ready();
         check(win.title === I18n.tr("%1 wants to send a text", "Pixel"), "a text: " + win.title);
         win.accept();
         check(win.accepted[13]?.dir === "", "a text is accepted without a folder");
@@ -426,13 +473,16 @@ ShellRoot {
         // The transfer in the background runs out of space: shown again.
         QuickShare.apply(inLine(11, "no-space", 0, ""));
         check(win.shown && win.mode === "result", "no space brings the window back: " + win.mode);
+        check(win.resultTitle === I18n.tr("Not received"), "outcome title: " + win.resultTitle);
         check(win.resultText === I18n.tr("Not enough free space in this folder."), "no-space text: " + win.resultText);
+        ready();
         check(key(win, Qt.Key_Escape) && !win.shown, "Close / Esc closes the outcome");
 
         // A nameless tablet: the progress keeps the name from the offer.
         offer(14, "", "tablet", [photos[0]], null);
         check(win.title === I18n.tr("%1 wants to send a file", I18n.tr("Tablet")), "one file from a tablet: " + win.title);
         check(win.subtitle.startsWith("IMG_1.jpg · "), "a single file shows its name: " + win.subtitle);
+        ready();
         win.accept();
         QuickShare.apply(inLine(14, "transferring", 0, ""));
         check(win.progressTitle === I18n.tr("Receiving from %1", I18n.tr("Tablet")), "progress names the tablet: " + win.progressTitle);
@@ -443,12 +493,40 @@ ShellRoot {
 
         // Cancelling here closes the window without an outcome.
         offer(15, "Galaxy S24", "phone", photos, null);
+        ready();
         win.accept();
         QuickShare.apply(inLine(15, "transferring", 0, ""));
         win.cancelTransfer();
         check(!win.shown, "cancelling closes the window");
         QuickShare.apply(inLine(15, "cancelled", 0, ""));
         check(!win.shown, "a transfer cancelled here shows no outcome");
+
+        // A background transfer that fails waits until the offer on screen
+        // is decided; the folder browser keeps its place meanwhile.
+        offer(16, "Galaxy S24", "phone", photos, null);
+        ready();
+        win.accept();
+        QuickShare.apply(inLine(16, "transferring", 0, ""));
+        win.toBackground();
+        offer(17, "Pixel", "phone", photos, null);
+        win.browser?.open(korea + "/Busan");
+        QuickShare.apply(inLine(16, "failed", 0, "connection reset"));
+        check(win.mode === "offer" && win.offer?.id === 17 && win.browser?.dir === korea + "/Busan", "a failure in the background doesn't replace the offer: " + win.mode + " " + win.browser?.dir);
+        ready();
+        key(win, Qt.Key_Escape);
+        check(win.mode === "result" && win.transferId === 16, "the failure shows once the offer is decided: " + win.mode);
+        win.armed = true;
+        win.dismiss();
+        QuickShare.apply(inLine(17, "rejected", 0, ""));
+        check(!win.shown, "nothing left to show");
+
+        // Cancelled from the other side (or the Wi-Fi went): an outcome.
+        offer(18, "Pixel", "phone", photos, null);
+        ready();
+        win.accept();
+        QuickShare.apply(inLine(18, "transferring", 0, ""));
+        QuickShare.apply(inLine(18, "cancelled", 0, ""));
+        check(win.mode === "result" && win.resultText === I18n.tr("The transfer was cancelled."), "cancelled text: " + win.resultText);
         win.destroy();
     }
 
@@ -458,8 +536,9 @@ ShellRoot {
     }
 
     Component.onCompleted: {
-        // Persist takes one change per event loop turn: the last folder is
-        // set here, the window is tried in the next turn.
+        // A second Persist write in one event loop turn reads back stale
+        // until the next turn: the last folder is set here, the window is
+        // tried in a later turn.
         Persist.quickShareDir = home + "/Bilder/Korea";
         step(testData);
         step(detailView);
@@ -474,6 +553,17 @@ ShellRoot {
             root.step(root.afterDestroy);
             root.step(root.folderBrowser);
             root.step(root.incomingWindow);
+            armDelay.start();
+        }
+    }
+
+    // Longer than the window's arming delay.
+    Timer {
+        id: armDelay
+
+        interval: 1000
+        onTriggered: {
+            root.step(root.incomingWindowArmed);
             root.step(root.translations);
             root.finish();
         }
