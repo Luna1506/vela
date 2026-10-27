@@ -107,6 +107,8 @@ enum Msg {
     Peer(u64, PeerEvent),
     /// A line a worker thread has ready (the answer to `pick`).
     Reply(Value),
+    /// The file dialog's worker is done; another dialog may open.
+    PickDone,
 }
 
 /// Reads commands until `input` ends; a line that is not a command is
@@ -405,6 +407,8 @@ struct Server<'a, W: Write> {
     load: Box<dyn Fn() -> config::Quickshare + Send>,
     probe_ble: Box<dyn Fn() -> bool + Send>,
     notify: Box<dyn Fn(Notice) + Send>,
+    /// A file dialog is open (one at a time).
+    picking: bool,
     /// The BLE beacon can run, as `hello` says.
     ble: bool,
     /// On the air while searching.
@@ -497,6 +501,7 @@ impl<'a, W: Write> Server<'a, W> {
             load: opts.load,
             probe_ble: opts.probe_ble,
             notify: opts.notify,
+            picking: false,
             ble,
             beacon: None,
             id: new_endpoint_id(),
@@ -583,6 +588,7 @@ impl<'a, W: Write> Server<'a, W> {
             Msg::Ended(id) => self.ended(id),
             Msg::Peer(search, e) if Some(search) == self.search => self.peer(e),
             Msg::Peer(..) => {}
+            Msg::PickDone => self.picking = false,
             Msg::Reply(v) => {
                 self.emit(&v);
             }
@@ -617,13 +623,22 @@ impl<'a, W: Write> Server<'a, W> {
                 self.emit(&reply);
             }
             Cmd::Pick { req } => {
+                if self.picking {
+                    let busy = anyhow::anyhow!("a file dialog is already open");
+                    self.emit(&pick_reply(req, Err(busy)));
+                    return;
+                }
                 // The dialog stays open as long as the user likes.
                 let tx = self.tx.clone();
                 let spawned = std::thread::Builder::new().name("quickshare-pick".into()).spawn(move || {
                     let _ = tx.send(Msg::Reply(pick_reply(req, desktop::pick_files())));
+                    let _ = tx.send(Msg::PickDone);
                 });
-                if let Err(e) = spawned {
-                    self.emit(&pick_reply(req, Err(e.into())));
+                match spawned {
+                    Ok(_) => self.picking = true,
+                    Err(e) => {
+                        self.emit(&pick_reply(req, Err(e.into())));
+                    }
                 }
             }
             Cmd::Stat { req, files } => {

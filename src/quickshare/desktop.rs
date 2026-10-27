@@ -132,11 +132,11 @@ pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        let hex = |at: usize| bytes.get(at).and_then(|b| char::from(*b).to_digit(16));
         if bytes[i] == b'%'
-            && let Some(hex) = bytes.get(i + 1..i + 3)
-            && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16)
+            && let (Some(hi), Some(lo)) = (hex(i + 1), hex(i + 2))
         {
-            out.push(byte);
+            out.push((hi * 16 + lo) as u8);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -186,7 +186,11 @@ struct Listener {
     conn: Connection,
     /// Notification id → URI to open.
     actions: HashMap<u32, String>,
+    /// Which listener thread serves this one.
+    generation: u64,
 }
+
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static LISTENER: Mutex<Option<Listener>> = Mutex::new(None);
 
@@ -198,7 +202,10 @@ fn listener() -> MutexGuard<'static, Option<Listener>> {
 /// `ActionInvoked`/`NotificationClosed` started on first use. The match rule
 /// is added before this returns, so no action can be missed.
 fn notification_bus() -> anyhow::Result<Connection> {
-    if let Some(l) = listener().as_ref() {
+    // Held until the listener is registered, so concurrent first calls
+    // start exactly one thread.
+    let mut guard = listener();
+    if let Some(l) = guard.as_ref() {
         return Ok(l.conn.clone());
     }
     let conn = Builder::session()
@@ -210,10 +217,7 @@ fn notification_bus() -> anyhow::Result<Connection> {
         .context("match rule")?
         .build();
     let signals = MessageIterator::for_match_rule(rule, &conn, None).context("listening for notification actions")?;
-    *listener() = Some(Listener {
-        conn: conn.clone(),
-        actions: HashMap::new(),
-    });
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     let spawned = std::thread::Builder::new().name("quickshare-notify".into()).spawn(move || {
         for msg in signals.flatten() {
             let header = msg.header();
@@ -240,19 +244,44 @@ fn notification_bus() -> anyhow::Result<Connection> {
             }
         }
         // The connection ended; the next notification starts over.
-        *listener() = None;
+        let mut guard = listener();
+        if guard.as_ref().is_some_and(|l| l.generation == generation) {
+            *guard = None;
+        }
     });
     if let Err(e) = spawned {
-        *listener() = None;
         bail!("cannot start the notification listener: {e}");
     }
+    *guard = Some(Listener {
+        conn: conn.clone(),
+        actions: HashMap::new(),
+        generation,
+    });
     Ok(conn)
+}
+
+/// Escapes the markup characters: notification daemons render markup in
+/// the body (some in the summary), and the texts come from the phone.
+fn escape_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Shows a notification; `action` is a button (and the click on the
 /// notification) that opens the URI. Bounded by [`CALL_TIMEOUT`].
 pub fn notify(summary: &str, body: &str, action: Option<(&str, String)>) -> anyhow::Result<()> {
     let conn = notification_bus()?;
+    let (summary, body) = (escape_markup(summary), escape_markup(body));
     let actions: Vec<&str> = action.iter().flat_map(|(label, _)| ["default", *label]).collect();
     let hints: HashMap<&str, Value<'_>> = HashMap::new();
     let reply = conn
@@ -261,7 +290,7 @@ pub fn notify(summary: &str, body: &str, action: Option<(&str, String)>) -> anyh
             NOTIFICATIONS_PATH,
             Some(NOTIFICATIONS),
             "Notify",
-            &("vela", 0u32, "folder-download", summary, body, actions, hints, -1i32),
+            &("vela", 0u32, "folder-download", summary.as_str(), body.as_str(), actions, hints, -1i32),
         )
         .context("showing the notification")?;
     let id: u32 = reply.body().deserialize().context("reading the notification id")?;
@@ -512,7 +541,18 @@ mod tests {
         for p in ["/home/a/a b#ä.txt", "/tmp/100%", "/x"] {
             assert_eq!(path_from_uri(&file_uri(p)), Some(PathBuf::from(p)), "{p}");
         }
+        assert_eq!(path_from_uri("file:///a%FFb"), Some(PathBuf::from(OsString::from_vec(b"/a\xffb".to_vec()))));
+        assert_eq!(path_from_uri("file:///a%2Fb"), Some(PathBuf::from("/a/b")));
+        assert_eq!(path_from_uri("file:///a%+fb"), Some(PathBuf::from("/a%+fb")));
+        assert_eq!(path_from_uri("file:///a%aéb"), Some(PathBuf::from("/a%aéb")));
         assert_eq!(file_uri("/a b"), "file:///a%20b");
+    }
+
+    #[test]
+    fn markup_is_escaped() {
+        assert_eq!(escape_markup("a <b & c"), "a &lt;b &amp; c");
+        assert_eq!(escape_markup(r#"<a href="x">'y'</a>"#), "&lt;a href=&quot;x&quot;&gt;&apos;y&apos;&lt;/a&gt;");
+        assert_eq!(escape_markup("plain ä"), "plain ä");
     }
 
     #[test]
