@@ -191,8 +191,14 @@ The name phones see and the port are set in the `[quickshare]` section of
 
 Known limitations, found with a Samsung Galaxy S25 (One UI 9):
 
-- If *Share with Apple devices* is on in the phone's Quick Share settings, the phone looks for PCs over Bluetooth only. vela also accepts these phones, but only with Bluetooth on the PC. The transfer then starts over Bluetooth and switches to Wi-Fi when the phone can reach the PC there; otherwise it continues over Bluetooth, which is slow.
+- If *Share with Apple devices* is on in the phone's Quick Share settings, the phone looks for PCs over Bluetooth only.
 - Some phones announce themselves without a name; vela then lists them as "Android phone".
+
+For phones that look for PCs over Bluetooth only, vela also advertises over
+Bluetooth while the PC's Bluetooth is on (not yet confirmed with every
+phone). A transfer from such a phone starts over Bluetooth and switches to
+Wi-Fi when the phone can reach the PC there; otherwise it continues over
+Bluetooth, which is slow.
 
 <br>
 

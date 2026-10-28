@@ -46,6 +46,9 @@ const SEAL_OVERHEAD: usize = 256;
 /// Stands in for "no deadline" when `now + timeout` does not fit an `Instant`.
 const FOREVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
+/// How long a switch to another link may take ([`Conn::switch_to`]).
+const SWITCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// A transport the connection runs over. Wi-Fi LAN uses a `TcpStream`; another
 /// medium only needs its own `Link`.
 pub trait Link: Read + Write + Send + 'static {
@@ -96,6 +99,8 @@ struct Switch {
     incoming: Frames,
     /// SAFE_TO_CLOSE_PRIOR_CHANNEL went out on the old link.
     safe_sent: bool,
+    /// When the switch is given up.
+    deadline: Instant,
 }
 
 /// An encrypted connection. A reader thread reads frames off the link; the
@@ -119,6 +124,8 @@ pub struct Conn {
     /// What to send once the switch is done. Sealed only then, so that the
     /// sequence numbers stay in the order the peer reads them.
     queued: Vec<V1Frame>,
+    /// [`SWITCH_TIMEOUT`], shorter in tests.
+    switch_timeout: Duration,
 }
 
 /// Reads frames off `link` on a thread of its own, at most [`READ_AHEAD`]
@@ -158,7 +165,13 @@ impl Conn {
             switch: None,
             peer_done: false,
             queued: Vec::new(),
+            switch_timeout: SWITCH_TIMEOUT,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_switch_timeout(&mut self, timeout: Duration) {
+        self.switch_timeout = timeout;
     }
 
     /// Sends a bandwidth upgrade frame.
@@ -175,7 +188,9 @@ impl Conn {
     /// SAFE_TO_CLOSE came too (or the old link ended), the old link gets an
     /// unencrypted DISCONNECTION and is closed, and the connection goes on
     /// over `link`. Frames from `link` are decrypted only after everything
-    /// read from the old one.
+    /// read from the old one. A switch that is not done after
+    /// [`SWITCH_TIMEOUT`] is given up: the connection stays on the old link
+    /// if the peer still writes there, else it fails.
     pub fn switch_to(&mut self, link: Box<dyn Link>) -> anyhow::Result<()> {
         if self.switch.is_some() {
             bail!("the connection is already moving to another link");
@@ -186,6 +201,7 @@ impl Conn {
             link,
             incoming,
             safe_sent: false,
+            deadline: Instant::now() + self.switch_timeout,
         });
         if self.peer_done {
             self.send_safe_to_close()?;
@@ -254,6 +270,11 @@ impl Conn {
             if self.closed {
                 return Ok(Some(Incoming::Disconnected));
             }
+            if self.switch.as_ref().is_some_and(|s| Instant::now() >= s.deadline)
+                && let Err(e) = self.give_up_switch()
+            {
+                return self.failed(e);
+            }
             // While switching, keep-alives wait for the new link.
             if !self.switching()
                 && self.last_send.elapsed() >= KEEP_ALIVE
@@ -261,10 +282,9 @@ impl Conn {
             {
                 return self.failed(e);
             }
-            let until_keep_alive = if self.switching() {
-                KEEP_ALIVE
-            } else {
-                KEEP_ALIVE.saturating_sub(self.last_send.elapsed())
+            let until_keep_alive = match &self.switch {
+                Some(s) => s.deadline.saturating_duration_since(Instant::now()),
+                None => KEEP_ALIVE.saturating_sub(self.last_send.elapsed()),
             };
             let wait = deadline.saturating_duration_since(Instant::now()).min(until_keep_alive);
             match self.incoming.recv_timeout(wait) {
@@ -375,6 +395,25 @@ impl Conn {
         self.peer_done = false;
         for v1 in std::mem::take(&mut self.queued) {
             self.write_now(v1)?;
+        }
+        Ok(())
+    }
+
+    /// The switch took too long. Unless the peer said it writes no more on
+    /// the old link (its LAST_WRITE), the connection goes on there with what
+    /// was queued; otherwise, or if the old link fails too, it fails.
+    fn give_up_switch(&mut self) -> io::Result<()> {
+        let Some(switch) = self.switch.take() else {
+            return Ok(());
+        };
+        let _ = switch.link.close();
+        let overdue = |why: String| io::Error::new(io::ErrorKind::TimedOut, format!("the switch to Wi-Fi did not finish in time{why}"));
+        if self.peer_done {
+            return Err(overdue(", and the phone no longer sends over Bluetooth".into()));
+        }
+        log::info!("quickshare: the switch to Wi-Fi did not finish in time, the transfer stays on Bluetooth");
+        for v1 in std::mem::take(&mut self.queued) {
+            self.write_now(v1).map_err(|e| overdue(format!(", and Bluetooth failed too: {e}")))?;
         }
         Ok(())
     }
@@ -547,7 +586,9 @@ mod tests {
     use crate::quickshare::proto::connections::payload_transfer_frame::{ControlMessage, control_message};
     use crate::quickshare::proto::sharing;
     use crate::quickshare::ukey2;
+    use std::collections::VecDeque;
     use std::net::TcpListener;
+    use std::sync::{Arc, Condvar, Mutex};
 
     const WAIT: Duration = Duration::from_secs(2);
 
@@ -579,7 +620,7 @@ mod tests {
         (Conn::new(Box::new(s), &sk).unwrap(), c, SecureChannel::new(&ck))
     }
 
-    fn send_raw(s: &mut TcpStream, chan: &mut SecureChannel, v1: V1Frame) {
+    fn send_raw(s: &mut impl Write, chan: &mut SecureChannel, v1: V1Frame) {
         let frame = OfflineFrame {
             version: Some(offline_frame::Version::V1 as i32),
             v1: Some(v1),
@@ -587,13 +628,13 @@ mod tests {
         write_frame(s, &chan.seal(&frame.encode_to_vec())).unwrap();
     }
 
-    fn recv_raw(s: &mut TcpStream, chan: &mut SecureChannel) -> V1Frame {
+    fn recv_raw(s: &mut impl Read, chan: &mut SecureChannel) -> V1Frame {
         let plain = chan.open(&read_frame(s).unwrap()).unwrap();
         OfflineFrame::decode(plain.as_slice()).unwrap().v1.unwrap()
     }
 
     /// The next frame from the `Conn` that is not a keep-alive.
-    fn recv_raw_skipping_keep_alive(s: &mut TcpStream, chan: &mut SecureChannel) -> V1Frame {
+    fn recv_raw_skipping_keep_alive(s: &mut impl Read, chan: &mut SecureChannel) -> V1Frame {
         loop {
             let v1 = recv_raw(s, chan);
             if v1.r#type() != FrameType::KeepAlive {
@@ -1001,5 +1042,286 @@ mod tests {
             data: b"https://example.org".to_vec(),
         };
         assert_eq!(next(&mut b).unwrap(), expected);
+    }
+
+    /// One direction of an in-memory link.
+    #[derive(Default)]
+    struct Pipe {
+        /// The bytes in it, and whether it is closed.
+        state: Mutex<(VecDeque<u8>, bool)>,
+        changed: Condvar,
+    }
+
+    impl Pipe {
+        /// Like a socket with a read timeout of [`WAIT`]; 0 once closed.
+        fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let (mut s, _) = self
+                .changed
+                .wait_timeout_while(self.state.lock().unwrap(), WAIT, |(bytes, closed)| bytes.is_empty() && !*closed)
+                .unwrap();
+            if s.0.is_empty() && !s.1 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let n = buf.len().min(s.0.len());
+            for (b, v) in buf.iter_mut().zip(s.0.drain(..n)) {
+                *b = v;
+            }
+            Ok(n)
+        }
+
+        fn write(&self, buf: &[u8]) -> io::Result<usize> {
+            let mut s = self.state.lock().unwrap();
+            if s.1 {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            s.0.extend(buf);
+            self.changed.notify_all();
+            Ok(buf.len())
+        }
+
+        fn close(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct PipeReader(Arc<Pipe>);
+
+    impl Read for PipeReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    /// One end of an in-memory link; closing either end closes both
+    /// directions.
+    struct MemLink {
+        rx: Arc<Pipe>,
+        tx: Arc<Pipe>,
+    }
+
+    fn mem_pair() -> (MemLink, MemLink) {
+        let (a, b) = (Arc::new(Pipe::default()), Arc::new(Pipe::default()));
+        (MemLink { rx: a.clone(), tx: b.clone() }, MemLink { rx: b, tx: a })
+    }
+
+    impl Read for MemLink {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.rx.read(buf)
+        }
+    }
+
+    impl Write for MemLink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.tx.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Link for MemLink {
+        fn reader(&self) -> io::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(PipeReader(self.rx.clone())))
+        }
+
+        fn close(&self) -> io::Result<()> {
+            self.rx.close();
+            self.tx.close();
+            Ok(())
+        }
+    }
+
+    fn upgrade(kind: UpgradeEvent) -> V1Frame {
+        bwu::v1(bwu::event(kind))
+    }
+
+    fn upgrade_event(v1: V1Frame) -> UpgradeEvent {
+        assert_eq!(v1.r#type(), FrameType::BandwidthUpgradeNegotiation, "{v1:?}");
+        v1.bandwidth_upgrade_negotiation.unwrap().event_type()
+    }
+
+    fn file_chunk(id: i64) -> V1Frame {
+        let mut v1 = bytes_payload(id, 3, 0, b"abc".to_vec(), true);
+        let t = v1.payload_transfer.as_mut().unwrap();
+        t.payload_header.as_mut().unwrap().r#type = Some(PayloadType::File as i32);
+        v1
+    }
+
+    fn is_file_chunk(v1: &V1Frame, id: i64) -> bool {
+        v1.payload_transfer.as_ref().and_then(|t| t.payload_header.as_ref()).and_then(|h| h.id) == Some(id)
+    }
+
+    /// A `Conn` in the middle of a switch, with the peer's ends of the old
+    /// and the new link and the peer's channel. Two frames went out on the
+    /// old link before, then LAST_WRITE_TO_PRIOR_CHANNEL, which the peer has
+    /// read.
+    struct Switching {
+        conn: Conn,
+        old: MemLink,
+        new: MemLink,
+        chan: SecureChannel,
+    }
+
+    fn switching(timeout: Duration) -> Switching {
+        let (ours_old, mut old) = mem_pair();
+        let (ours_new, new) = mem_pair();
+        let mut conn = Conn::new(Box::new(ours_old), &fixed_keys(false)).unwrap();
+        conn.set_switch_timeout(timeout);
+        let mut chan = SecureChannel::new(&fixed_keys(true));
+        conn.send_sharing(&introduction()).unwrap();
+        for _ in 0..2 {
+            recv_raw(&mut old, &mut chan);
+        }
+        conn.switch_to(Box::new(ours_new)).unwrap();
+        assert!(conn.switching());
+        assert_eq!(upgrade_event(recv_raw(&mut old, &mut chan)), UpgradeEvent::LastWriteToPriorChannel);
+        Switching { conn, old, new, chan }
+    }
+
+    /// Calls `recv` until the switch is over; nothing else may come up.
+    fn finish(conn: &mut Conn) {
+        let deadline = Instant::now() + WAIT;
+        while conn.switching() {
+            assert!(Instant::now() < deadline, "the switch did not end");
+            assert_eq!(conn.recv(Duration::from_millis(20)).unwrap(), None);
+        }
+    }
+
+    /// The next frame on `link` is the plaintext DISCONNECTION, then the
+    /// link is closed.
+    fn plain_disconnection_then_closed(link: &mut MemLink) {
+        assert!(is_plain_disconnection(&read_frame(link).unwrap()));
+        assert_eq!(link.read(&mut [0; 8]).unwrap(), 0, "the old link is closed");
+    }
+
+    /// The peer's frame over the new link arrives: our receive sequence
+    /// went on from the old link.
+    fn new_link_carries_frames_in(s: &mut Switching) {
+        send_raw(&mut s.new, &mut s.chan, file_chunk(9));
+        let expected = Incoming::FileChunk {
+            payload_id: 9,
+            offset: 0,
+            body: b"abc".to_vec(),
+            last: true,
+        };
+        assert_eq!(next(&mut s.conn).unwrap(), expected);
+    }
+
+    #[test]
+    fn frames_sent_while_switching_go_out_afterwards_in_sequence() {
+        let mut s = switching(SWITCH_TIMEOUT);
+        s.conn.send_file_chunk(7, 3, 0, b"abc", true).unwrap();
+        s.conn.send_keep_alive(false).unwrap();
+        send_raw(&mut s.old, &mut s.chan, upgrade(UpgradeEvent::LastWriteToPriorChannel));
+        send_raw(&mut s.old, &mut s.chan, upgrade(UpgradeEvent::SafeToClosePriorChannel));
+        finish(&mut s.conn);
+
+        // On the old link: SAFE_TO_CLOSE (sealed with the next sequence
+        // number, or the peer could not open it), then the plaintext goodbye.
+        assert_eq!(upgrade_event(recv_raw(&mut s.old, &mut s.chan)), UpgradeEvent::SafeToClosePriorChannel);
+        plain_disconnection_then_closed(&mut s.old);
+        // The queued chunk is the first frame on the new link, sealed after
+        // SAFE_TO_CLOSE; the keep-alive was dropped.
+        let first = recv_raw(&mut s.new, &mut s.chan);
+        assert!(is_file_chunk(&first, 7), "{first:?}");
+        new_link_carries_frames_in(&mut s);
+    }
+
+    #[test]
+    fn a_plaintext_disconnection_on_the_old_link_ends_the_switch() {
+        let mut s = switching(SWITCH_TIMEOUT);
+        s.conn.send_file_chunk(7, 3, 0, b"abc", true).unwrap();
+        send_raw(&mut s.old, &mut s.chan, upgrade(UpgradeEvent::LastWriteToPriorChannel));
+        let goodbye = OfflineFrame {
+            version: Some(offline_frame::Version::V1 as i32),
+            v1: Some(disconnection()),
+        };
+        write_frame(&mut s.old, &goodbye.encode_to_vec()).unwrap();
+        finish(&mut s.conn);
+
+        assert_eq!(upgrade_event(recv_raw(&mut s.old, &mut s.chan)), UpgradeEvent::SafeToClosePriorChannel);
+        plain_disconnection_then_closed(&mut s.old);
+        assert!(is_file_chunk(&recv_raw(&mut s.new, &mut s.chan), 7));
+        new_link_carries_frames_in(&mut s);
+    }
+
+    #[test]
+    fn the_old_link_ending_early_ends_the_switch() {
+        let mut s = switching(SWITCH_TIMEOUT);
+        s.conn.send_file_chunk(7, 3, 0, b"abc", true).unwrap();
+        s.old.close().unwrap();
+        finish(&mut s.conn);
+        assert!(is_file_chunk(&recv_raw(&mut s.new, &mut s.chan), 7));
+        new_link_carries_frames_in(&mut s);
+    }
+
+    #[test]
+    fn a_switch_that_takes_too_long_falls_back_to_the_old_link() {
+        let mut s = switching(Duration::from_millis(300));
+        s.conn.send_file_chunk(7, 3, 0, b"abc", true).unwrap();
+        let start = Instant::now();
+        finish(&mut s.conn);
+        assert!(start.elapsed() >= Duration::from_millis(250), "gave up after {:?}", start.elapsed());
+
+        // The queued chunk goes out on the old link, in sequence after
+        // LAST_WRITE; the new link is closed.
+        assert!(is_file_chunk(&recv_raw_skipping_keep_alive(&mut s.old, &mut s.chan), 7));
+        assert_eq!(s.new.read(&mut [0; 8]).unwrap(), 0, "the new link is closed");
+        // And the connection goes on there.
+        send_raw(&mut s.old, &mut s.chan, file_chunk(9));
+        assert!(matches!(next(&mut s.conn).unwrap(), Incoming::FileChunk { payload_id: 9, .. }));
+    }
+
+    #[test]
+    fn a_switch_the_peer_left_unfinished_fails() {
+        // The peer said it writes no more on the old link, but its
+        // SAFE_TO_CLOSE never comes: there is nothing to fall back to.
+        let mut s = switching(Duration::from_millis(300));
+        send_raw(&mut s.old, &mut s.chan, upgrade(UpgradeEvent::LastWriteToPriorChannel));
+        let start = Instant::now();
+        let err = loop {
+            assert!(start.elapsed() < WAIT, "the switch did not end");
+            match s.conn.recv(Duration::from_millis(20)) {
+                Ok(None) => {}
+                Ok(Some(other)) => panic!("{other:?}"),
+                Err(e) => break e,
+            }
+        };
+        assert!(start.elapsed() >= Duration::from_millis(250), "gave up after {:?}", start.elapsed());
+        assert!(format!("{err:#}").contains("did not finish"), "{err:#}");
+        assert_eq!(s.conn.recv(Duration::ZERO).unwrap(), Some(Incoming::Disconnected));
+        assert_eq!(upgrade_event(recv_raw(&mut s.old, &mut s.chan)), UpgradeEvent::SafeToClosePriorChannel);
+        assert_eq!(s.new.read(&mut [0; 8]).unwrap(), 0, "the new link is closed");
+    }
+
+    #[test]
+    fn closing_during_a_switch_still_tells_the_peer() {
+        // A local cancel: CANCEL and DISCONNECTION wait for the switch,
+        // which here never finishes; they go out on the old link once it is
+        // given up.
+        let mut s = switching(Duration::from_millis(300));
+        let mut old = s.old;
+        let mut chan = s.chan;
+        let peer = thread::spawn(move || {
+            let mut got = Vec::new();
+            loop {
+                let v1 = recv_raw_skipping_keep_alive(&mut old, &mut chan);
+                let end = v1.r#type() == FrameType::Disconnection;
+                got.push(v1.r#type());
+                if end {
+                    return got;
+                }
+            }
+        });
+        crate::quickshare::send_cancel(&mut s.conn);
+        crate::quickshare::close(&mut s.conn);
+        let got = peer.join().unwrap();
+        assert_eq!(
+            got,
+            [FrameType::PayloadTransfer, FrameType::PayloadTransfer, FrameType::Disconnection],
+            "CANCEL (two chunks), then DISCONNECTION"
+        );
     }
 }

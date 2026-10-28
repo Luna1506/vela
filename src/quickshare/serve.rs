@@ -651,7 +651,11 @@ impl<'a, W: Write> Server<'a, W> {
             }
         });
         match hub {
-            Ok(_) => self.ble_receiver = Some(receiver),
+            Ok(_) => {
+                self.ble_receiver = Some(receiver);
+                // Losing it again later is worth a warning again.
+                self.ble_warned = false;
+            }
             Err(e) => log::warn!("quickshare: cannot read from Bluetooth: {e}"),
         }
     }

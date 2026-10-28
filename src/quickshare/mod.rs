@@ -249,9 +249,16 @@ fn send_cancel(conn: &mut Conn) {
 }
 
 /// Sends DISCONNECTION and waits up to [`LINGER`] for the peer to close too,
-/// so the last frames are read before the socket goes away.
+/// so the last frames are read before the socket goes away. During a switch
+/// to another link, what is still to be said (a CANCEL, the DISCONNECTION)
+/// goes out when the switch ends, which takes at most its timeout.
 fn close(conn: &mut Conn) {
     let _ = conn.send_disconnect();
+    while conn.switching() {
+        if let Ok(Some(Incoming::Disconnected)) | Err(_) = conn.recv(POLL) {
+            break;
+        }
+    }
     let deadline = Instant::now() + LINGER;
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match conn.recv(left) {

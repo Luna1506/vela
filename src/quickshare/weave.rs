@@ -54,6 +54,9 @@ const MAX_PACKET: usize = 512;
 const CONTROL_PREFIX: [u8; 3] = [0; 3];
 /// The largest message: a frame with its length and the hash in front.
 const MAX_MESSAGE: usize = MAX_FRAME + 4 + SERVICE_HASH.len();
+/// At most this much read and not yet taken: a phone that sends further
+/// ahead loses its link.
+const MAX_INBOUND: usize = 2 * MAX_MESSAGE;
 /// `SocketControlFrame.ControlFrameType`.
 const INTRODUCTION: i32 = 1;
 const DISCONNECTION: i32 = 2;
@@ -354,8 +357,19 @@ impl Shared {
         self.changed.notify_all();
     }
 
-    fn push(&self, data: Vec<u8>) {
-        self.update(|s| s.inbound.extend(data));
+    /// False (and the link ended) when `data` does not fit within
+    /// [`MAX_INBOUND`].
+    fn push(&self, data: Vec<u8>) -> bool {
+        let mut fits = true;
+        self.update(|s| {
+            if s.inbound.len() + data.len() > MAX_INBOUND {
+                s.ended = true;
+                fits = false;
+            } else {
+                s.inbound.extend(data);
+            }
+        });
+        fits
     }
 
     fn end(&self) {
@@ -512,6 +526,24 @@ struct Active {
     device: OwnedObjectPath,
     receiving: Receiving,
     shared: Arc<Shared>,
+    /// Our ConnectionConfirm.
+    confirm: Vec<u8>,
+    /// The phone has written since its ConnectionRequest, so it had the
+    /// confirm.
+    heard: bool,
+}
+
+impl Active {
+    /// Ends the link after an error, telling the phone if it can be done
+    /// without waiting: a writer may hold the counter while it waits for a
+    /// confirmation.
+    fn fail(&self) {
+        let counter = self.shared.writer.try_lock().map(|w| w.counter).ok();
+        if let Some(counter) = counter {
+            let _ = self.shared.send_now(&error_packet(counter));
+        }
+        self.shared.end();
+    }
 }
 
 /// Makes links out of what phones do with the Weave characteristics.
@@ -543,7 +575,16 @@ impl Hub {
                     a.shared.end();
                 }
             }
-            gatt::Event::Subscribed | gatt::Event::Released => {}
+            // A confirm indicated before the phone subscribed went nowhere.
+            gatt::Event::Subscribed => {
+                if let Some(a) = self.active.as_ref().filter(|a| !a.heard) {
+                    log::debug!("quickshare: {} subscribed after its ConnectionRequest, confirming again", a.device.as_str());
+                    if let Err(e) = a.shared.send_now(&a.confirm) {
+                        log::warn!("quickshare: cannot answer {} over Bluetooth: {e}", a.device.as_str());
+                    }
+                }
+            }
+            gatt::Event::Released => {}
         }
         None
     }
@@ -567,13 +608,23 @@ impl Hub {
             return None;
         }
         let active = self.active.as_mut()?;
+        active.heard = true;
         let got = if head & CONTROL != 0 {
             Err(anyhow::anyhow!("Weave control packet {head:#04x}"))
         } else {
             active.receiving.push(data)
         };
         match got {
-            Ok(Got::Data(bytes)) => active.shared.push(bytes),
+            Ok(Got::Data(bytes)) => {
+                if !active.shared.push(bytes) {
+                    log::error!(
+                        "quickshare: {} sends over Bluetooth faster than it is read (over {MAX_INBOUND} bytes ahead), ending the connection",
+                        device.as_str()
+                    );
+                    active.fail();
+                    self.active = None;
+                }
+            }
             Ok(Got::Nothing) => {}
             Ok(Got::Disconnected) => {
                 log::info!("quickshare: {} ended the Bluetooth connection", device.as_str());
@@ -582,13 +633,7 @@ impl Hub {
             }
             Err(e) => {
                 log::warn!("quickshare: Bluetooth connection with {}: {e:#}", device.as_str());
-                // Best effort: a writer may hold the counter while it waits
-                // for a confirmation.
-                let counter = active.shared.writer.try_lock().map(|w| w.counter).ok();
-                if let Some(counter) = counter {
-                    let _ = active.shared.send_now(&error_packet(counter));
-                }
-                active.shared.end();
+                active.fail();
                 self.active = None;
             }
         }
@@ -610,10 +655,14 @@ impl Hub {
             let _ = (self.indicate)(&error_packet(0));
             return None;
         }
+        if let Some(extra) = data.get(7..).filter(|d| !d.is_empty()) {
+            log::debug!("quickshare: {} sent data with its ConnectionRequest: {}", device.as_str(), hex(extra));
+        }
         let size = packet_size(request.max_packet, mtu);
         let indicate = self.indicate.clone();
         let shared = Arc::new(Shared::new(Box::new(move |p| indicate(p)), true, size));
-        if let Err(e) = shared.send_now(&confirm(size)) {
+        let confirm = confirm(size);
+        if let Err(e) = shared.send_now(&confirm) {
             log::warn!("quickshare: cannot answer {} over Bluetooth: {e}", device.as_str());
             return None;
         }
@@ -626,6 +675,8 @@ impl Hub {
             device,
             receiving: Receiving::new(false),
             shared: shared.clone(),
+            confirm,
+            heard: false,
         });
         Some(WeaveLink { shared })
     }
@@ -701,7 +752,11 @@ pub(crate) mod fake {
                         Ok(p) => {
                             let _ = confirms.send(gatt::Event::Confirmed);
                             match receiving.push(&p) {
-                                Ok(Got::Data(b)) => reading.push(b),
+                                Ok(Got::Data(b)) => {
+                                    if !reading.push(b) {
+                                        return;
+                                    }
+                                }
                                 Ok(Got::Nothing) => {}
                                 Ok(Got::Disconnected) | Err(_) => return reading.end(),
                             }
@@ -978,5 +1033,53 @@ mod tests {
         let mut hub = Hub::new(indicate);
         drop(hub.handle(write(DEVICE, &[0x80, 0, 1, 0, 1, 0, 0], 23)).unwrap());
         assert!(hub.handle(write("/dev/other", &[0x80, 0, 1, 0, 1, 0, 0], 23)).is_some());
+    }
+
+    #[test]
+    fn a_late_subscription_gets_the_confirm_again() {
+        let (indicate, sent) = indications();
+        let mut hub = Hub::new(indicate);
+        let _link = hub.handle(write(DEVICE, &[0x80, 0, 1, 0, 1, 0, 0], 185)).unwrap();
+        let confirm = sent.try_recv().unwrap();
+        // The phone subscribes only now: the first confirm went nowhere.
+        hub.handle(gatt::Event::Subscribed);
+        assert_eq!(sent.try_recv().unwrap(), confirm);
+
+        // Once the phone has written, it had the confirm.
+        hub.handle(gatt::Event::Confirmed);
+        let mut intro = vec![0x1c];
+        intro.extend(introduction());
+        hub.handle(write(DEVICE, &intro, 185));
+        hub.handle(gatt::Event::Subscribed);
+        assert!(sent.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_phone_far_ahead_of_the_reader_loses_its_link() {
+        let (indicate, sent) = indications();
+        let mut hub = Hub::new(indicate);
+        let mut link = hub.handle(write(DEVICE, &[0x80, 0, 1, 0, 1, 0, 0], 517)).unwrap();
+        sent.try_recv().unwrap();
+        let mut counter = 1;
+        let mut packets = fragment(&introduction(), MAX_PACKET, &mut counter);
+        let piece = vec![7u8; 64 * 1024];
+        let pieces = 2 * MAX_MESSAGE / piece.len() + 2;
+        for _ in 0..pieces {
+            packets.extend(fragment(&data_message(&piece), MAX_PACKET, &mut counter));
+        }
+        for p in &packets {
+            hub.handle(write(DEVICE, p, 517));
+        }
+        assert_eq!(sent.try_recv().unwrap(), [0x92], "an error packet");
+        let mut read = 0;
+        let mut buf = vec![0; 1 << 20];
+        loop {
+            match link.read(&mut buf).unwrap() {
+                0 => break,
+                n => read += n,
+            }
+        }
+        assert!(read <= 2 * MAX_MESSAGE, "the link ended at the limit: {read}");
+        assert!(read < pieces * piece.len());
     }
 }

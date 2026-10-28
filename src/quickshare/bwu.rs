@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::net::{Ipv4Addr, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -28,6 +29,10 @@ use super::write_plain;
 const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const ARRIVAL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long a session that stopped waiting still waits for a hand-over
+/// that claimed it just before (it is writing the ack).
+const CLAIMED_WAIT: Duration = Duration::from_secs(5);
 
 /// `f` as a frame.
 pub fn v1(f: BandwidthUpgradeNegotiationFrame) -> V1Frame {
@@ -79,52 +84,83 @@ pub fn client_introduction(v1: &V1Frame) -> Option<Vec<String>> {
         return None;
     }
     let intro = f.client_introduction.as_ref()?;
-    let ids: Vec<String> = [&intro.endpoint_id, &intro.last_endpoint_id].into_iter().flatten().cloned().collect();
+    let ids: Vec<String> = [&intro.endpoint_id, &intro.last_endpoint_id]
+        .into_iter()
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .collect();
     (!ids.is_empty()).then_some(ids)
 }
 
+/// A session's place in a [`Rendezvous`]: which one it is (a newer session
+/// of the same phone may take its endpoint id) and where its connection goes.
+struct Waiting {
+    session: u64,
+    arrivals: mpsc::Sender<TcpStream>,
+}
+
 /// Where sessions wait for the phone's new connection, by its endpoint id.
+/// A session takes one connection: the first that claims it.
 #[derive(Clone, Default)]
-pub struct Rendezvous(Arc<Mutex<HashMap<String, mpsc::Sender<TcpStream>>>>);
+pub struct Rendezvous(Arc<Mutex<HashMap<String, Waiting>>>);
 
 /// A session waiting in a [`Rendezvous`]; dropping it stops waiting.
 struct Expected {
     arrivals: mpsc::Receiver<TcpStream>,
     endpoint: String,
+    session: u64,
     rendezvous: Rendezvous,
+}
+
+impl Expected {
+    /// No connection claims this session from now on.
+    fn stop(&self) {
+        let mut waiting = self.rendezvous.lock();
+        if waiting.get(&self.endpoint).is_some_and(|w| w.session == self.session) {
+            waiting.remove(&self.endpoint);
+        }
+    }
 }
 
 impl Drop for Expected {
     fn drop(&mut self) {
-        self.rendezvous.lock().remove(&self.endpoint);
+        self.stop();
     }
 }
 
 impl Rendezvous {
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, mpsc::Sender<TcpStream>>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Waiting>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn expect(&self, endpoint: &str) -> Expected {
+        static SESSIONS: AtomicU64 = AtomicU64::new(0);
+        let session = SESSIONS.fetch_add(1, Ordering::Relaxed);
         let (tx, arrivals) = mpsc::channel();
-        self.lock().insert(endpoint.to_owned(), tx);
+        self.lock().insert(endpoint.to_owned(), Waiting { session, arrivals: tx });
         Expected {
             arrivals,
             endpoint: endpoint.to_owned(),
+            session,
             rendezvous: self.clone(),
         }
     }
 
     /// Acks the introduction of the phone with one of the endpoint ids
     /// `ids` on `stream` and hands the stream to the session waiting for it;
-    /// false (and nothing written) if none waits.
+    /// false (and nothing written) if none waits. The session is claimed
+    /// before the ack goes out, so only one connection is ever acked.
     pub fn hand_over(&self, ids: &[String], stream: TcpStream) -> anyhow::Result<bool> {
-        let waiting = ids.iter().find_map(|id| self.lock().get(id).cloned());
-        let Some(waiting) = waiting else {
+        let claimed = {
+            let mut waiting = self.lock();
+            ids.iter().filter(|id| !id.is_empty()).find_map(|id| waiting.remove(id))
+        };
+        let Some(waiting) = claimed else {
             return Ok(false);
         };
         write_plain(&stream, client_introduction_ack())?;
-        Ok(waiting.send(stream).is_ok())
+        Ok(waiting.arrivals.send(stream).is_ok())
     }
 }
 
@@ -150,6 +186,10 @@ impl Upgrade {
             log::info!("quickshare: no network address to offer, the transfer stays on Bluetooth");
             return Ok(None);
         };
+        if endpoint.is_empty() {
+            log::info!("quickshare: the phone has no endpoint id to find it by over Wi-Fi, the transfer stays on Bluetooth");
+            return Ok(None);
+        }
         let expected = offer.rendezvous.expect(endpoint);
         conn.send_upgrade(upgrade_path_available_wifi_lan(ip, offer.port))?;
         log::info!("quickshare: offering {endpoint} to go on over Wi-Fi at {ip}:{}", offer.port);
@@ -164,17 +204,24 @@ impl Upgrade {
         let Some((expected, deadline)) = &self.waiting else {
             return Ok(());
         };
-        match expected.arrivals.try_recv() {
-            Ok(stream) => {
-                self.waiting = None;
+        let stream = match expected.arrivals.try_recv() {
+            Ok(stream) => Some(stream),
+            Err(TryRecvError::Empty) if Instant::now() < *deadline => return Ok(()),
+            // Stop waiting first, then look once more: a hand-over that
+            // claimed this session just before has acked the phone, so its
+            // connection is taken (once the ack is written).
+            Err(_) => {
+                expected.stop();
+                expected.arrivals.recv_timeout(CLAIMED_WAIT).ok()
+            }
+        };
+        self.waiting = None;
+        match stream {
+            Some(stream) => {
                 log::info!("quickshare: the transfer goes on over Wi-Fi");
                 conn.switch_to(Box::new(stream))?;
             }
-            Err(TryRecvError::Empty) if Instant::now() < *deadline => {}
-            Err(_) => {
-                self.waiting = None;
-                log::info!("quickshare: the phone did not connect over Wi-Fi, the transfer stays on Bluetooth");
-            }
+            None => log::info!("quickshare: the phone did not connect over Wi-Fi, the transfer stays on Bluetooth"),
         }
         Ok(())
     }
@@ -366,6 +413,8 @@ mod tests {
         assert_eq!(client_introduction(&v1(f.clone())), None, "no endpoint id");
         f.client_introduction.as_mut().unwrap().last_endpoint_id = Some("LAST".into());
         assert_eq!(client_introduction(&v1(f.clone())), Some(vec!["LAST".into()]));
+        f.client_introduction.as_mut().unwrap().endpoint_id = Some(String::new());
+        assert_eq!(client_introduction(&v1(f.clone())), Some(vec!["LAST".into()]), "an empty id is none");
         f.client_introduction.as_mut().unwrap().endpoint_id = Some("PHON".into());
         assert_eq!(client_introduction(&v1(f)), Some(vec!["PHON".into(), "LAST".into()]));
         assert_eq!(client_introduction(&v1(event(EventType::UpgradePathAvailable))), None);
@@ -558,16 +607,96 @@ mod tests {
         falls_back(true);
     }
 
+    /// Connections over loopback: the phone's end and ours.
+    struct Connections(TcpListener);
+
+    impl Connections {
+        fn new() -> Connections {
+            Connections(TcpListener::bind("127.0.0.1:0").unwrap())
+        }
+
+        fn accept(&self) -> (TcpStream, TcpStream) {
+            let client = TcpStream::connect(self.0.local_addr().unwrap()).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            (client, self.0.accept().unwrap().0)
+        }
+    }
+
+    fn ack(client: &TcpStream) {
+        let ack = crate::quickshare::read_plain(client).unwrap();
+        assert_eq!(ack.bandwidth_upgrade_negotiation.unwrap().event_type(), EventType::ClientIntroductionAck);
+    }
+
+    /// The phone's end gets nothing and is closed.
+    fn no_ack(mut client: TcpStream) {
+        assert_eq!(std::io::Read::read(&mut client, &mut [0; 8]).unwrap(), 0, "closed without an ack");
+    }
+
+    #[test]
+    fn a_waiting_session_takes_one_connection_only() {
+        let rendezvous = Rendezvous::default();
+        let connections = Connections::new();
+        let expected = rendezvous.expect("PHON");
+        let phone = ["PHON".to_owned()];
+        let (first, server) = connections.accept();
+        assert!(rendezvous.hand_over(&phone, server).unwrap());
+        let (second, server) = connections.accept();
+        assert!(!rendezvous.hand_over(&phone, server).unwrap(), "the session is taken");
+        no_ack(second);
+        ack(&first);
+        assert!(expected.arrivals.try_recv().is_ok());
+        assert!(expected.arrivals.try_recv().is_err(), "one connection");
+    }
+
+    #[test]
+    fn another_phone_leaves_a_waiting_session_alone() {
+        let rendezvous = Rendezvous::default();
+        let connections = Connections::new();
+        let expected = rendezvous.expect("PHON");
+        let (other, server) = connections.accept();
+        assert!(!rendezvous.hand_over(&["OTHR".to_owned()], server).unwrap());
+        no_ack(other);
+        let (empty, server) = connections.accept();
+        assert!(!rendezvous.hand_over(&[String::new()], server).unwrap(), "an empty id matches nothing");
+        no_ack(empty);
+        assert!(expected.arrivals.try_recv().is_err());
+
+        let (client, server) = connections.accept();
+        assert!(rendezvous.hand_over(&["PHON".to_owned()], server).unwrap(), "still waiting");
+        ack(&client);
+        assert!(expected.arrivals.try_recv().is_ok());
+    }
+
+    #[test]
+    fn no_upgrade_without_an_endpoint_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let keys = crate::quickshare::ukey2::Keys {
+            auth: [0; 32],
+            encrypt: [1; 32],
+            decrypt: [2; 32],
+            send_hmac: [3; 32],
+            recv_hmac: [4; 32],
+        };
+        let mut conn = Conn::new(Box::new(ours), &keys).unwrap();
+        let offer = Offer {
+            ip: Some(Ipv4Addr::LOCALHOST),
+            port: 1,
+            rendezvous: Rendezvous::default(),
+        };
+        assert!(Upgrade::start(&mut conn, &offer, "").unwrap().is_none());
+        assert!(offer.rendezvous.lock().is_empty(), "nothing registered");
+        drop(conn);
+        assert_eq!(std::io::Read::read(&mut peer, &mut [0; 8]).unwrap(), 0, "no offer went out");
+    }
+
     #[test]
     fn only_a_waiting_session_gets_the_connection() {
         let rendezvous = Rendezvous::default();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let accept = || {
-            let client = TcpStream::connect(addr).unwrap();
-            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            (client, listener.accept().unwrap().0)
-        };
+        let connections = Connections::new();
+        let accept = || connections.accept();
         let phone = ["PHON".to_owned()];
         let (mut client, server) = accept();
         assert!(!rendezvous.hand_over(&phone, server).unwrap());
