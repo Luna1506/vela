@@ -1,7 +1,8 @@
 //! The connection after the plaintext part (ConnectionRequest, UKEY2,
 //! ConnectionResponse): encrypted `OfflineFrame`s, the payload layer on top of
 //! them (BYTES payloads carrying `sharing.nearby.Frame`s, FILE payloads in
-//! chunks) and the keep-alive Android expects every 10 seconds.
+//! chunks), the keep-alive Android expects every 10 seconds and the move to
+//! another link in a bandwidth upgrade ([`Conn::switch_to`]).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -14,15 +15,18 @@ use anyhow::{Context, bail};
 use prost::Message;
 
 use super::frame::{MAX_FRAME, read_frame, write_frame};
-use super::proto;
+use super::proto::connections::bandwidth_upgrade_negotiation_frame::EventType as UpgradeEvent;
 use super::proto::connections::payload_transfer_frame::control_message::EventType;
 use super::proto::connections::payload_transfer_frame::payload_chunk::Flags;
 use super::proto::connections::payload_transfer_frame::payload_header::PayloadType;
 use super::proto::connections::payload_transfer_frame::{PacketType, PayloadChunk, PayloadHeader};
 use super::proto::connections::v1_frame::FrameType;
-use super::proto::connections::{DisconnectionFrame, KeepAliveFrame, OfflineFrame, PayloadTransferFrame, V1Frame, offline_frame};
+use super::proto::connections::{
+    BandwidthUpgradeNegotiationFrame, DisconnectionFrame, KeepAliveFrame, OfflineFrame, PayloadTransferFrame, V1Frame, offline_frame,
+};
 use super::secure::SecureChannel;
 use super::ukey2::Keys;
+use super::{bwu, proto, write_plain};
 
 /// How long the connection may stay silent before a `KEEP_ALIVE` goes out.
 #[cfg(not(test))]
@@ -78,6 +82,20 @@ pub enum Incoming {
     PayloadCancelled { payload_id: i64 },
     /// The peer sent a DISCONNECTION frame or closed the connection.
     Disconnected,
+    /// A bandwidth upgrade frame other than the two the switch itself uses
+    /// (see [`Conn::switch_to`]).
+    Upgrade(BandwidthUpgradeNegotiationFrame),
+}
+
+/// Frames read off a link by its reader thread.
+type Frames = mpsc::Receiver<io::Result<Vec<u8>>>;
+
+/// The link a connection is moving to.
+struct Switch {
+    link: Box<dyn Link>,
+    incoming: Frames,
+    /// SAFE_TO_CLOSE_PRIOR_CHANNEL went out on the old link.
+    safe_sent: bool,
 }
 
 /// An encrypted connection. A reader thread reads frames off the link; the
@@ -86,7 +104,7 @@ pub enum Incoming {
 pub struct Conn {
     link: Box<dyn Link>,
     secure: SecureChannel,
-    incoming: mpsc::Receiver<io::Result<Vec<u8>>>,
+    incoming: Frames,
     last_send: Instant,
     next_payload_id: i64,
     /// BYTES payloads still waiting for their last chunk, by payload id.
@@ -94,25 +112,38 @@ pub struct Conn {
     /// BYTES payload ids handed up raw instead of decoded as sharing frames.
     raw: HashSet<i64>,
     closed: bool,
+    switch: Option<Switch>,
+    /// The peer's LAST_WRITE_TO_PRIOR_CHANNEL came: it writes nothing more
+    /// on `link`.
+    peer_done: bool,
+    /// What to send once the switch is done. Sealed only then, so that the
+    /// sequence numbers stay in the order the peer reads them.
+    queued: Vec<V1Frame>,
+}
+
+/// Reads frames off `link` on a thread of its own, at most [`READ_AHEAD`]
+/// ahead. The thread ends on the first read error (EOF after `close`) or
+/// once the receiver is gone.
+fn read_frames(link: &dyn Link) -> io::Result<Frames> {
+    let mut reader = link.reader()?;
+    let (tx, incoming) = mpsc::sync_channel(READ_AHEAD);
+    thread::Builder::new().name("quickshare-conn".into()).spawn(move || {
+        loop {
+            let frame = read_frame(&mut reader);
+            let failed = frame.is_err();
+            if tx.send(frame).is_err() || failed {
+                break;
+            }
+        }
+    })?;
+    Ok(incoming)
 }
 
 impl Conn {
     /// Starts the encrypted part of a connection. Call it after the plaintext
     /// ConnectionRequest, UKEY2 and ConnectionResponse.
     pub fn new(link: Box<dyn Link>, keys: &Keys) -> io::Result<Conn> {
-        let mut reader = link.reader()?;
-        let (tx, incoming) = mpsc::sync_channel(READ_AHEAD);
-        // Ends on the first read error (EOF after `close`) or once the
-        // receiver is gone.
-        thread::Builder::new().name("quickshare-conn".into()).spawn(move || {
-            loop {
-                let frame = read_frame(&mut reader);
-                let failed = frame.is_err();
-                if tx.send(frame).is_err() || failed {
-                    break;
-                }
-            }
-        })?;
+        let incoming = read_frames(link.as_ref())?;
         Ok(Conn {
             link,
             secure: SecureChannel::new(keys),
@@ -124,7 +155,47 @@ impl Conn {
             bytes: HashMap::new(),
             raw: HashSet::new(),
             closed: false,
+            switch: None,
+            peer_done: false,
+            queued: Vec::new(),
         })
+    }
+
+    /// Sends a bandwidth upgrade frame.
+    pub fn send_upgrade(&mut self, f: BandwidthUpgradeNegotiationFrame) -> anyhow::Result<()> {
+        self.send(bwu::v1(f))?;
+        Ok(())
+    }
+
+    /// Moves the connection to `link` (a bandwidth upgrade; the plaintext
+    /// CLIENT_INTRODUCTION and its ack have already gone over it), keeping
+    /// the keys and the sequence numbers. LAST_WRITE_TO_PRIOR_CHANNEL goes
+    /// out on the old link now and SAFE_TO_CLOSE_PRIOR_CHANNEL once the
+    /// peer's LAST_WRITE came; everything else waits. Once the peer's
+    /// SAFE_TO_CLOSE came too (or the old link ended), the old link gets an
+    /// unencrypted DISCONNECTION and is closed, and the connection goes on
+    /// over `link`. Frames from `link` are decrypted only after everything
+    /// read from the old one.
+    pub fn switch_to(&mut self, link: Box<dyn Link>) -> anyhow::Result<()> {
+        if self.switch.is_some() {
+            bail!("the connection is already moving to another link");
+        }
+        let incoming = read_frames(link.as_ref())?;
+        self.write_now(bwu::v1(bwu::event(UpgradeEvent::LastWriteToPriorChannel)))?;
+        self.switch = Some(Switch {
+            link,
+            incoming,
+            safe_sent: false,
+        });
+        if self.peer_done {
+            self.send_safe_to_close()?;
+        }
+        Ok(())
+    }
+
+    /// Between [`Conn::switch_to`] and the end of the switch.
+    pub fn switching(&self) -> bool {
+        self.switch.is_some()
     }
 
     /// Sends a `sharing.nearby.Frame` as a BYTES payload the way Android does:
@@ -159,11 +230,7 @@ impl Conn {
 
     /// Tells the peer the connection is over.
     pub fn send_disconnect(&mut self) -> anyhow::Result<()> {
-        self.send(V1Frame {
-            r#type: Some(FrameType::Disconnection as i32),
-            disconnection: Some(DisconnectionFrame::default()),
-            ..V1Frame::default()
-        })?;
+        self.send(disconnection())?;
         Ok(())
     }
 
@@ -187,12 +254,18 @@ impl Conn {
             if self.closed {
                 return Ok(Some(Incoming::Disconnected));
             }
-            if self.last_send.elapsed() >= KEEP_ALIVE
+            // While switching, keep-alives wait for the new link.
+            if !self.switching()
+                && self.last_send.elapsed() >= KEEP_ALIVE
                 && let Err(e) = self.send_keep_alive(false)
             {
                 return self.failed(e);
             }
-            let until_keep_alive = KEEP_ALIVE.saturating_sub(self.last_send.elapsed());
+            let until_keep_alive = if self.switching() {
+                KEEP_ALIVE
+            } else {
+                KEEP_ALIVE.saturating_sub(self.last_send.elapsed())
+            };
             let wait = deadline.saturating_duration_since(Instant::now()).min(until_keep_alive);
             match self.incoming.recv_timeout(wait) {
                 Ok(Ok(frame)) => {
@@ -205,6 +278,12 @@ impl Conn {
                         return Ok(None);
                     }
                 }
+                // The old link ended before the peer's SAFE_TO_CLOSE.
+                Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) if self.switching() => {
+                    if let Err(e) = self.finish_switch(false) {
+                        return self.failed(e);
+                    }
+                }
                 Ok(Err(e)) => return self.failed(e),
                 Err(RecvTimeoutError::Disconnected) => self.closed = true,
                 Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => return Ok(None),
@@ -214,7 +293,17 @@ impl Conn {
     }
 
     fn handle(&mut self, frame: &[u8]) -> anyhow::Result<Option<Incoming>> {
-        let plain = self.secure.open(frame)?;
+        let plain = match self.secure.open(frame) {
+            Ok(plain) => plain,
+            // The peer's last word on the old link is not encrypted.
+            Err(_) if self.switching() && is_plain_disconnection(frame) => {
+                if let Err(e) = self.finish_switch(true) {
+                    return self.failed(e);
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         let frame = OfflineFrame::decode(plain.as_slice()).context("decoding OfflineFrame")?;
         let Some(v1) = frame.v1 else {
             return Ok(None);
@@ -233,8 +322,61 @@ impl Conn {
                 self.closed = true;
                 Ok(Some(Incoming::Disconnected))
             }
+            FrameType::BandwidthUpgradeNegotiation => {
+                let f = v1.bandwidth_upgrade_negotiation.context("BANDWIDTH_UPGRADE_NEGOTIATION without content")?;
+                let done = match f.event_type() {
+                    UpgradeEvent::LastWriteToPriorChannel => {
+                        self.peer_done = true;
+                        match &self.switch {
+                            Some(s) if !s.safe_sent => self.send_safe_to_close(),
+                            _ => Ok(()),
+                        }
+                    }
+                    UpgradeEvent::SafeToClosePriorChannel if self.switching() => self.finish_switch(true),
+                    _ => return Ok(Some(Incoming::Upgrade(f))),
+                };
+                match done {
+                    Ok(()) => Ok(None),
+                    Err(e) => self.failed(e),
+                }
+            }
             _ => Ok(None),
         }
+    }
+
+    fn send_safe_to_close(&mut self) -> io::Result<()> {
+        let safe = bwu::BandwidthUpgradeNegotiationFrame {
+            safe_to_close_prior_channel: Some(Default::default()),
+            ..bwu::event(UpgradeEvent::SafeToClosePriorChannel)
+        };
+        self.write_now(bwu::v1(safe))?;
+        if let Some(s) = &mut self.switch {
+            s.safe_sent = true;
+        }
+        Ok(())
+    }
+
+    /// Ends the switch: from now on the new link carries the connection.
+    /// `old_alive`: the old link still takes the last frames.
+    fn finish_switch(&mut self, old_alive: bool) -> io::Result<()> {
+        let Some(switch) = self.switch.take() else {
+            return Ok(());
+        };
+        if old_alive {
+            if !switch.safe_sent {
+                let _ = self.send_safe_to_close();
+            }
+            let _ = write_plain(&mut self.link, disconnection());
+        }
+        let _ = self.link.close();
+        self.link = switch.link;
+        // Whatever the peer still sent on the old link is not read.
+        self.incoming = switch.incoming;
+        self.peer_done = false;
+        for v1 in std::mem::take(&mut self.queued) {
+            self.write_now(v1)?;
+        }
+        Ok(())
     }
 
     fn payload(&mut self, transfer: PayloadTransferFrame) -> anyhow::Result<Option<Incoming>> {
@@ -343,7 +485,19 @@ impl Conn {
         })
     }
 
+    /// Sends `v1`, or keeps it for the new link while switching (a
+    /// keep-alive is dropped then).
     fn send(&mut self, v1: V1Frame) -> io::Result<()> {
+        if self.switching() {
+            if v1.r#type() != FrameType::KeepAlive {
+                self.queued.push(v1);
+            }
+            return Ok(());
+        }
+        self.write_now(v1)
+    }
+
+    fn write_now(&mut self, v1: V1Frame) -> io::Result<()> {
         let frame = OfflineFrame {
             version: Some(offline_frame::Version::V1 as i32),
             v1: Some(v1),
@@ -364,10 +518,26 @@ impl Conn {
     }
 }
 
+fn disconnection() -> V1Frame {
+    V1Frame {
+        r#type: Some(FrameType::Disconnection as i32),
+        disconnection: Some(DisconnectionFrame::default()),
+        ..V1Frame::default()
+    }
+}
+
+/// An unencrypted `OfflineFrame` with a DISCONNECTION.
+fn is_plain_disconnection(frame: &[u8]) -> bool {
+    OfflineFrame::decode(frame).is_ok_and(|f| f.v1.is_some_and(|v1| v1.r#type() == FrameType::Disconnection))
+}
+
 impl Drop for Conn {
     fn drop(&mut self) {
-        // Wakes the reader thread; it exits on the resulting read error.
+        // Wakes the reader threads; they exit on the resulting read error.
         let _ = self.link.close();
+        if let Some(s) = &self.switch {
+            let _ = s.link.close();
+        }
     }
 }
 

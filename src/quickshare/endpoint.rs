@@ -7,7 +7,9 @@ use rand::RngExt;
 pub const SERVICE_TYPE: &str = "_FC9F5ED42C8A._tcp.local.";
 
 const HIDDEN_BIT: u8 = 0x10;
-const SERVICE_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
+/// `SHA-256("NearbySharing")[0..3]`, the service id hash in mDNS names,
+/// Bluetooth advertisements and Bluetooth socket messages.
+pub const SERVICE_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
 const ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

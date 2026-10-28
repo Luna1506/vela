@@ -15,10 +15,13 @@
 //!   which makes phones read the slot over GATT.
 //!
 //! All of it stays registered until the [`Receiver`] is dropped. What
-//! phones do with the Weave characteristics arrives as [`Event`]s.
+//! phones do with the Weave characteristics arrives as [`Event`]s (for
+//! [`weave::Hub`](super::weave::Hub)); [`Receiver::indicator`] sends
+//! indications back.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::io;
+use std::sync::{Arc, mpsc};
 
 use anyhow::Context;
 use zbus::blocking::Connection;
@@ -29,6 +32,7 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use super::ble::{self, BLUEZ, CALL_TIMEOUT};
 use super::blead;
 use super::endpoint::EndpointInfo;
+use super::weave::Indicate;
 
 const SERVICE_UUID: &str = "0000fef3-0000-1000-8000-00805f9b34fb";
 /// Advertisement slot 0.
@@ -49,6 +53,7 @@ const EXTENDED_ADV_PATH: &str = "/org/vela/quickshare/receive_adv0";
 const LEGACY_ADV_PATH: &str = "/org/vela/quickshare/receive_adv1";
 
 const GATT_MANAGER: &str = "org.bluez.GattManager1";
+const CHARACTERISTIC: &str = "org.bluez.GattCharacteristic1";
 
 /// What phones do with the Weave characteristics, in the order BlueZ tells
 /// us. BlueZ sends indications to every subscribed phone and does not say
@@ -64,6 +69,9 @@ pub enum Event {
     Unsubscribed,
     /// A phone confirmed an indication.
     Confirmed,
+    /// BlueZ dropped an advertisement (Bluetooth switched off, adapter
+    /// gone): phones no longer find us.
+    Released,
 }
 
 /// The errors BlueZ turns into ATT errors.
@@ -171,7 +179,9 @@ impl WeaveIn {
     }
 }
 
-/// Weave packets to phones: each change of `Value` is one indication.
+/// Weave packets to phones: each change of `Value` is one indication
+/// ([`Receiver::indicator`]); BlueZ calls `Confirm` when the phone confirmed
+/// it.
 struct WeaveOut {
     events: mpsc::Sender<Event>,
 }
@@ -220,6 +230,7 @@ fn service_data(data: &[u8]) -> HashMap<String, Value<'static>> {
 /// The medium advertisement as an extended connectable advertisement.
 struct ExtendedAdvertisement {
     medium: Vec<u8>,
+    events: mpsc::Sender<Event>,
 }
 
 #[zbus::interface(name = "org.bluez.LEAdvertisement1")]
@@ -227,6 +238,7 @@ impl ExtendedAdvertisement {
     /// BlueZ dropped the advertisement (Bluetooth switched off, adapter gone).
     fn release(&self) {
         log::info!("quickshare: BlueZ released the extended Bluetooth advertisement");
+        let _ = self.events.send(Event::Released);
     }
 
     #[zbus(property, name = "Type")]
@@ -248,6 +260,7 @@ impl ExtendedAdvertisement {
 /// The header as a legacy connectable advertisement.
 struct LegacyAdvertisement {
     header: [u8; 17],
+    events: mpsc::Sender<Event>,
 }
 
 #[zbus::interface(name = "org.bluez.LEAdvertisement1")]
@@ -255,6 +268,7 @@ impl LegacyAdvertisement {
     /// BlueZ dropped the advertisement (Bluetooth switched off, adapter gone).
     fn release(&self) {
         log::info!("quickshare: BlueZ released the Bluetooth advertisement");
+        let _ = self.events.send(Event::Released);
     }
 
     #[zbus(property, name = "Type")]
@@ -282,20 +296,28 @@ pub struct Receiver {
 impl Receiver {
     /// Makes endpoint `endpoint_id` with `info` visible and connectable
     /// over Bluetooth LE on the first powered adapter. Weave writes and
-    /// subscriptions go to `incoming`. Fails if BlueZ, an adapter, the GATT
+    /// subscriptions (and BlueZ releasing an advertisement) go to
+    /// `incoming`. Fails if BlueZ, an adapter, the GATT
     /// service or the legacy advertisement is not there; an extended
     /// advertisement that fails is only logged.
     pub fn start(endpoint_id: [u8; 4], info: &EndpointInfo, incoming: mpsc::Sender<Event>) -> anyhow::Result<Receiver> {
         let medium = blead::medium_advertisement(endpoint_id, info);
+        let events = incoming.clone();
         let connect = || -> zbus::Result<Connection> {
             Builder::system()?
                 .method_timeout(CALL_TIMEOUT)
                 .serve_at(SERVICE_PATH, Service)?
                 .serve_at(SLOT_PATH, Slot { value: medium.clone() })?
-                .serve_at(WEAVE_IN_PATH, WeaveIn { events: incoming.clone() })?
-                .serve_at(WEAVE_OUT_PATH, WeaveOut { events: incoming })?
+                .serve_at(WEAVE_IN_PATH, WeaveIn { events: events.clone() })?
+                .serve_at(WEAVE_OUT_PATH, WeaveOut { events: events.clone() })?
                 .serve_at(APP_PATH, ObjectManager)?
-                .serve_at(EXTENDED_ADV_PATH, ExtendedAdvertisement { medium: medium.clone() })?
+                .serve_at(
+                    EXTENDED_ADV_PATH,
+                    ExtendedAdvertisement {
+                        medium: medium.clone(),
+                        events,
+                    },
+                )?
                 .build()
         };
         let conn = connect().context("the system D-Bus is not available")?;
@@ -324,7 +346,10 @@ impl Receiver {
             }
         };
         let header = blead::header(&medium, extended);
-        receiver.conn.object_server().at(LEGACY_ADV_PATH, LegacyAdvertisement { header })?;
+        receiver
+            .conn
+            .object_server()
+            .at(LEGACY_ADV_PATH, LegacyAdvertisement { header, events: incoming })?;
         receiver.advertise(LEGACY_ADV_PATH)?;
         log::info!(
             "quickshare: visible over Bluetooth on {} ({} advertisement(s))",
@@ -333,6 +358,24 @@ impl Receiver {
         );
         log::debug!("quickshare: BLE medium advertisement {}, header {}", hex(&medium), hex(&header));
         Ok(receiver)
+    }
+
+    /// Sends one packet to the phones that turned indications on, as a
+    /// change of the Weave characteristic's `Value`.
+    pub fn indicator(&self) -> Indicate {
+        let conn = self.conn.clone();
+        Arc::new(move |packet: &[u8]| {
+            let changed = HashMap::from([("Value", Value::from(packet.to_vec()))]);
+            let body = (CHARACTERISTIC, changed, Vec::<&str>::new());
+            conn.emit_signal(
+                None::<zbus::names::BusName<'_>>,
+                WEAVE_OUT_PATH,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &body,
+            )
+            .map_err(io::Error::other)
+        })
     }
 
     /// Registers the advertisement at `path`.
@@ -367,5 +410,13 @@ impl Drop for Receiver {
                 log::debug!("quickshare: unregistering the GATT service: {e}");
             }
         }
+        // The objects hold senders of the event channel and an indicator
+        // holds the connection: removing them ends the channel, so whoever
+        // reads it (and the indicator with it) lets go.
+        let server = self.conn.object_server();
+        let _ = server.remove::<WeaveIn, _>(WEAVE_IN_PATH);
+        let _ = server.remove::<WeaveOut, _>(WEAVE_OUT_PATH);
+        let _ = server.remove::<ExtendedAdvertisement, _>(EXTENDED_ADV_PATH);
+        let _ = server.remove::<LegacyAdvertisement, _>(LEGACY_ADV_PATH);
     }
 }

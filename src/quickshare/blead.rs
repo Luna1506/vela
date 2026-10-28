@@ -13,10 +13,8 @@
 
 use sha2::{Digest, Sha256};
 
-use super::endpoint::EndpointInfo;
+use super::endpoint::{EndpointInfo, SERVICE_HASH};
 
-/// `SHA-256("NearbySharing")[0..3]`.
-pub const SERVICE_ID_HASH: [u8; 3] = [0xFC, 0x9F, 0x5E];
 /// Connections advertisement byte 0: version 1 (3 bits), PCP 3
 /// (P2P_POINT_TO_POINT, 5 bits).
 const CONNECTIONS_VERSION_PCP: u8 = (1 << 5) | 3;
@@ -53,7 +51,7 @@ pub fn medium_advertisement(endpoint_id: [u8; 4], info: &EndpointInfo) -> Vec<u8
 /// as Google's advertiser sends one) and no extra fields.
 fn medium(endpoint_id: [u8; 4], endpoint_info: &[u8], token: [u8; 2]) -> Vec<u8> {
     let mut connections = vec![CONNECTIONS_VERSION_PCP];
-    connections.extend(SERVICE_ID_HASH);
+    connections.extend(SERVICE_HASH);
     connections.extend(endpoint_id);
     connections.push(endpoint_info.len() as u8);
     connections.extend(endpoint_info);
@@ -63,7 +61,7 @@ fn medium(endpoint_id: [u8; 4], endpoint_info: &[u8], token: [u8; 2]) -> Vec<u8>
     connections.extend([0, 0]);
 
     let mut out = vec![MEDIUM_VERSION];
-    out.extend(SERVICE_ID_HASH);
+    out.extend(SERVICE_HASH);
     out.extend((connections.len() as u32).to_be_bytes());
     out.extend(connections);
     out.extend(token);

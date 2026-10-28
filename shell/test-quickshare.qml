@@ -244,6 +244,16 @@ ShellRoot {
             check(QuickShare.bleReceive === on, "hello sets bleReceive " + on);
             check(hint?.visible === !on, "hint shown " + hint?.visible + " with bleReceive " + on);
         }
+        // A backend that is gone leaves no Bluetooth state behind.
+        QuickShare.apply(JSON.stringify({
+            type: "hello",
+            name: QuickShare.name,
+            port: 47392,
+            ble: true,
+            bleReceive: true
+        }));
+        QuickShare.reset();
+        check(!QuickShare.ble && !QuickShare.bleReceive, "reset clears ble " + QuickShare.ble + " and bleReceive " + QuickShare.bleReceive);
         QuickShare.connected = wasConnected;
         page?.destroy();
     }

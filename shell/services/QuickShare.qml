@@ -303,6 +303,8 @@ Singleton {
     // Nothing of the old backend survives: its ids and requests are gone.
     function reset(): void {
         connected = false;
+        ble = false;
+        bleReceive = false;
         devices = [];
         transfers = ({});
         sendQueue = [];

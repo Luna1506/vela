@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 
-use super::conn::{Conn, Incoming};
+use super::conn::{Conn, Incoming, Link};
 use super::endpoint::EndpointInfo;
 use super::proto::connections::connection_request_frame::Medium;
 use super::proto::connections::{ConnectionRequestFrame, V1Frame, v1_frame};
@@ -115,13 +115,26 @@ pub(super) fn connect(
 ) -> anyhow::Result<Step<Conn>> {
     let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).with_context(|| format!("connecting to {addr}"))?;
     prepare(&stream)?;
-    write_plain(&stream, connection_request(me, endpoint_id))?;
-    let keys = ukey2::client(&mut &stream, &mut &stream)?;
-    on_pin(ukey2::pin(&keys.auth));
-    write_plain(&stream, connection_response())?;
-    check_connection_response(&read_plain(&stream)?)?;
+    connect_link(stream, me, endpoint_id, cancel, on_pin)
+}
 
-    let mut conn = Conn::new(Box::new(stream), &keys)?;
+/// [`connect`] over a link that is already open.
+pub(super) fn connect_link(
+    mut link: impl Link,
+    me: &EndpointInfo,
+    endpoint_id: [u8; 4],
+    cancel: &AtomicBool,
+    on_pin: impl FnOnce(String),
+) -> anyhow::Result<Step<Conn>> {
+    write_plain(&mut link, connection_request(me, endpoint_id))?;
+    let mut reader = link.reader()?;
+    let keys = ukey2::client(&mut reader, &mut link)?;
+    on_pin(ukey2::pin(&keys.auth));
+    write_plain(&mut link, connection_response())?;
+    check_connection_response(&read_plain(&mut reader)?)?;
+    drop(reader);
+
+    let mut conn = Conn::new(Box::new(link), &keys)?;
     conn.send_sharing(&paired_key_encryption())?;
     let (mut got_encryption, mut got_result) = (false, false);
     while !(got_encryption && got_result) {

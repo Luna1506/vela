@@ -4,7 +4,9 @@
 //! to stderr. Listens on `quickshare.port` and announces itself over mDNS;
 //! every incoming connection runs on its own thread, so several offers can
 //! wait at once. Phones that search over Bluetooth only find us through our
-//! GATT service and its advertisements. While searching, a BLE beacon makes
+//! GATT service and its advertisements and send over it (one phone at a
+//! time); such a transfer moves to our port when the phone can reach it over
+//! Wi-Fi. While searching, a BLE beacon makes
 //! phones show up. Ends when stdin closes or on SIGTERM/SIGINT: the
 //! announcements are withdrawn, the search and the beacon stopped and running
 //! transfers are cancelled (which removes their partial files).
@@ -28,7 +30,7 @@ use serde_json::{Value, json};
 use super::desktop::{self, Notice};
 use super::endpoint::{DeviceKind, EndpointInfo, SERVICE_TYPE, new_endpoint_id};
 use super::mdns::{self, Advertisement, Peer, PeerEvent};
-use super::{Decision, Event, Offer, OfferText, Outcome, ble, files, gatt, inbound, outbound};
+use super::{Decision, Event, Offer, OfferText, Outcome, ble, bwu, files, gatt, inbound, outbound, weave};
 use crate::config;
 
 /// How long ending waits for transfers to wind down.
@@ -101,6 +103,11 @@ enum Msg {
     /// SIGTERM or SIGINT.
     Stop,
     Connection(TcpStream),
+    /// A phone opened a Bluetooth connection.
+    BleLink(weave::WeaveLink),
+    /// BlueZ dropped the advertisements of the BLE receiver with this
+    /// number.
+    BleReleased(u64),
     Event(Event),
     /// A transfer's thread is done; every event it sent came before.
     Ended(u64),
@@ -397,14 +404,18 @@ struct Options {
     /// Whether the BLE beacon can run, asked at the start and on `reload`.
     probe_ble: Box<dyn Fn() -> bool + Send>,
     receive_ble: ReceiveBle,
+    /// The address a Bluetooth transfer offers the phone to go on over
+    /// Wi-Fi ([`bwu::local_ipv4`]).
+    upgrade_ip: Box<dyn Fn() -> Option<Ipv4Addr> + Send>,
     /// Shows a notification (must not block).
     notify: Box<dyn Fn(Notice) + Send>,
 }
 
 /// Makes endpoint `id` with this info visible and connectable over
 /// Bluetooth (sending what phones do to the channel) until the returned
-/// guard is dropped: [`gatt::Receiver::start`].
-type ReceiveBle = Box<dyn Fn([u8; 4], &EndpointInfo, mpsc::Sender<gatt::Event>) -> anyhow::Result<Box<dyn Send>> + Send>;
+/// guard is dropped, and how to indicate to phones:
+/// [`gatt::Receiver::start`], [`gatt::Receiver::indicator`].
+type ReceiveBle = Box<dyn Fn([u8; 4], &EndpointInfo, mpsc::Sender<gatt::Event>) -> anyhow::Result<(Box<dyn Send>, weave::Indicate)> + Send>;
 
 struct Server<'a, W: Write> {
     out: &'a mut W,
@@ -423,8 +434,13 @@ struct Server<'a, W: Write> {
     receive_ble: ReceiveBle,
     /// Visible over Bluetooth, as `hello` says (`bleReceive`).
     ble_receiver: Option<Box<dyn Send>>,
-    /// Where the BLE receiver sends what phones do.
-    ble_events: mpsc::Sender<gatt::Event>,
+    /// The number of the latest BLE receiver.
+    ble_receivers: u64,
+    /// Starting the BLE receiver failed before (warned once).
+    ble_warned: bool,
+    upgrade_ip: Box<dyn Fn() -> Option<Ipv4Addr> + Send>,
+    /// Where Bluetooth transfers wait for the phone's Wi-Fi connection.
+    rendezvous: bwu::Rendezvous,
     /// Our endpoint id, for this run.
     id: [u8; 4],
     name: String,
@@ -453,7 +469,13 @@ pub fn run() -> anyhow::Result<()> {
         mdns: true,
         load: Box::new(|| load_config().quickshare),
         probe_ble: Box::new(probe_ble),
-        receive_ble: Box::new(|id, info, events| gatt::Receiver::start(id, info, events).map(|r| Box::new(r) as Box<dyn Send>)),
+        receive_ble: Box::new(|id, info, events| {
+            gatt::Receiver::start(id, info, events).map(|r| {
+                let indicate = r.indicator();
+                (Box::new(r) as Box<dyn Send>, indicate)
+            })
+        }),
+        upgrade_ip: Box::new(bwu::local_ipv4),
         notify: Box::new(desktop::notify_detached),
     };
     serve(tx, rx, &mut std::io::stdout().lock(), opts)
@@ -507,15 +529,6 @@ impl<'a, W: Write> Server<'a, W> {
                 bail!(message);
             }
         };
-        // What phones write over Bluetooth; reading it into connections
-        // comes later, until then it is only logged (by gatt).
-        let (ble_events, written) = mpsc::channel::<gatt::Event>();
-        let drained = std::thread::Builder::new()
-            .name("quickshare-ble".into())
-            .spawn(move || written.into_iter().for_each(drop));
-        if let Err(e) = drained {
-            log::warn!("quickshare: cannot read from Bluetooth: {e}");
-        }
         let mut server = Server {
             out,
             connected: true,
@@ -528,7 +541,10 @@ impl<'a, W: Write> Server<'a, W> {
             beacon: None,
             receive_ble: opts.receive_ble,
             ble_receiver: None,
-            ble_events,
+            ble_receivers: 0,
+            ble_warned: false,
+            upgrade_ip: opts.upgrade_ip,
+            rendezvous: bwu::Rendezvous::default(),
             id: new_endpoint_id(),
             name: settings.effective_name(),
             configured_port: settings.port,
@@ -547,7 +563,6 @@ impl<'a, W: Write> Server<'a, W> {
             server.name,
             String::from_utf8_lossy(&server.id)
         );
-        server.receive_over_ble();
         server.hello();
         if opts.mdns {
             match ServiceDaemon::new() {
@@ -555,6 +570,11 @@ impl<'a, W: Write> Server<'a, W> {
                 Err(e) => server.error(format!("mDNS is not available: {e}"), json!({})),
             }
             server.advertise();
+        }
+        // BlueZ may take a while; the shell and mDNS do not wait for it.
+        server.receive_over_ble();
+        if server.ble_receiver.is_some() {
+            server.hello();
         }
         Ok(server)
     }
@@ -591,14 +611,48 @@ impl<'a, W: Write> Server<'a, W> {
         }
     }
 
-    /// (Re)starts the BLE receiver under the current name. Without it
-    /// phones that search over Bluetooth only do not find us; the shell
-    /// explains that from `hello`, so a failure is no error line.
+    /// (Re)starts the BLE receiver under the current name; a thread turns
+    /// what phones do into links ([`weave::Hub`]). Without it phones that
+    /// search over Bluetooth only do not find us; the shell explains that
+    /// from `hello`, so a failure is no error line (and a warning only the
+    /// first time).
     fn receive_over_ble(&mut self) {
         self.ble_receiver = None;
-        match (self.receive_ble)(self.id, &self.me(), self.ble_events.clone()) {
-            Ok(receiver) => self.ble_receiver = Some(receiver),
-            Err(e) => log::warn!("quickshare: not visible over Bluetooth, phones searching only there won't find us: {e:#}"),
+        self.ble_receivers += 1;
+        let number = self.ble_receivers;
+        let (events, rx) = mpsc::channel();
+        let (receiver, indicate) = match (self.receive_ble)(self.id, &self.me(), events) {
+            Ok(started) => started,
+            Err(e) => {
+                let e = format!("quickshare: not visible over Bluetooth, phones searching only there won't find us: {e:#}");
+                if std::mem::replace(&mut self.ble_warned, true) {
+                    log::debug!("{e}");
+                } else {
+                    log::warn!("{e}");
+                }
+                return;
+            }
+        };
+        let tx = self.tx.clone();
+        // Ends when the receiver is dropped (its end of the channel goes).
+        let hub = std::thread::Builder::new().name("quickshare-ble".into()).spawn(move || {
+            let mut hub = weave::Hub::new(indicate);
+            for e in rx {
+                let msg = match e {
+                    gatt::Event::Released => Msg::BleReleased(number),
+                    e => match hub.handle(e) {
+                        Some(link) => Msg::BleLink(link),
+                        None => continue,
+                    },
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        });
+        match hub {
+            Ok(_) => self.ble_receiver = Some(receiver),
+            Err(e) => log::warn!("quickshare: cannot read from Bluetooth: {e}"),
         }
     }
 
@@ -628,6 +682,13 @@ impl<'a, W: Write> Server<'a, W> {
             }
             Msg::Cmd(cmd) => self.command(cmd),
             Msg::Connection(stream) => self.incoming(stream),
+            Msg::BleLink(link) => self.incoming_ble(link),
+            Msg::BleReleased(number) => {
+                if number == self.ble_receivers && self.ble_receiver.take().is_some() {
+                    log::info!("quickshare: no longer visible over Bluetooth (tried again on reload)");
+                    self.hello();
+                }
+            }
             Msg::Event(e) => self.event(e),
             Msg::Ended(id) => self.ended(id),
             Msg::Peer(search, e) if Some(search) == self.search => self.peer(e),
@@ -729,8 +790,32 @@ impl<'a, W: Write> Server<'a, W> {
         let id = self.next_id();
         let from = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         log::info!("quickshare: connection {id} from {from}");
+        let rendezvous = self.rendezvous.clone();
+        self.receive(id, move |events, decisions, cancel| {
+            inbound::handle_tcp(stream, id, events, decisions, cancel, &rendezvous)
+        });
+    }
+
+    /// Like [`Server::incoming`], over Bluetooth; an accepted transfer is
+    /// offered to go on over Wi-Fi to our port.
+    fn incoming_ble(&mut self, link: weave::WeaveLink) {
+        let id = self.next_id();
+        log::info!("quickshare: connection {id} over Bluetooth");
+        let offer = bwu::Offer {
+            ip: (self.upgrade_ip)(),
+            port: self.listener.port,
+            rendezvous: self.rendezvous.clone(),
+        };
+        self.receive(id, move |events, decisions, cancel| {
+            inbound::handle_link(link, id, events, decisions, cancel, Some(offer))
+        });
+    }
+
+    /// Runs incoming connection `id` (`job` gets the decisions for its
+    /// offer).
+    fn receive(&mut self, id: u64, job: impl FnOnce(mpsc::Sender<Event>, mpsc::Receiver<Decision>, Arc<AtomicBool>) -> anyhow::Result<()> + Send + 'static) {
         let (decide, decisions) = mpsc::channel();
-        match self.spawn(id, move |events, cancel| inbound::handle(stream, id, events, decisions, cancel)) {
+        match self.spawn(id, move |events, cancel| job(events, decisions, cancel)) {
             Ok((cancel, thread)) => {
                 let mut t = Transfer::new("in", cancel, thread);
                 t.decisions = Some(decide);
@@ -1279,6 +1364,7 @@ mod tests {
             load: Box::new(move || config::Quickshare { name: "test-pc".into(), port }),
             probe_ble: Box::new(|| false),
             receive_ble: Box::new(|_, _, _| Err(anyhow::anyhow!("no Bluetooth in tests"))),
+            upgrade_ip: Box::new(|| Some(Ipv4Addr::LOCALHOST)),
             notify: Box::new(move |n| {
                 let _ = ntx.send(n);
             }),
@@ -1476,9 +1562,11 @@ mod tests {
             });
             o.receive_ble = Box::new(move |id, info, _| {
                 s.lock().unwrap().push((id, info.name.clone().unwrap()));
-                Ok(Box::new(Guard(d.clone())))
+                Ok((Box::new(Guard(d.clone())), weave::fake::indications().0))
             });
         });
+        // First the port and mDNS, then Bluetooth.
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], false);
         assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
 
         r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
@@ -1497,6 +1585,123 @@ mod tests {
         let names: Vec<&str> = started.iter().map(|(_, n)| n.as_str()).collect();
         assert_eq!(names, ["test-pc", "renamed"]);
         assert_eq!(started[0].0, started[1].0, "one endpoint id per run");
+    }
+
+    #[test]
+    fn ble_receiver_comes_back_on_reload() {
+        // Fails at the start, works on the first reload; BlueZ then
+        // releases it, the second reload starts it again.
+        let (calls, stopped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let events = Arc::new(Mutex::new(None));
+        let (c, d, e) = (calls.clone(), stopped.clone(), events.clone());
+        let r = start_with(0, move |o| {
+            o.receive_ble = Box::new(move |_, _, tx| {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("Bluetooth is off");
+                }
+                *e.lock().unwrap() = Some(tx);
+                Ok((Box::new(Guard(d.clone())), weave::fake::indications().0))
+            });
+        });
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], false);
+        r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+
+        let tx = events.lock().unwrap().take().unwrap();
+        tx.send(gatt::Event::Released).unwrap();
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], false);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1, "the released receiver is dropped");
+        // The second advertisement's release changes nothing more.
+        tx.send(gatt::Event::Released).unwrap();
+        r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // A late release of the old receiver does not drop the new one.
+        tx.send(gatt::Event::Released).unwrap();
+        r.tx.send(Msg::Cmd(Cmd::Reload)).unwrap();
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+
+        r.tx.send(Msg::Eof).unwrap();
+        r.thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_phone_over_bluetooth_is_offered_like_one_over_wifi_and_moves_to_it() {
+        let dest = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..200 * 1024u32).map(|i| (i % 253) as u8).collect();
+        let (indicate, indications) = weave::fake::indications();
+        let events = Arc::new(Mutex::new(None));
+        let e = events.clone();
+        let r = start_with(0, move |o| {
+            o.receive_ble = Box::new(move |_, _, tx| {
+                *e.lock().unwrap() = Some(tx);
+                Ok((Box::new(()), indicate.clone()))
+            });
+        });
+        next(&r.lines, "hello");
+        assert_eq!(next(&r.lines, "hello")["bleReceive"], true);
+        let tx = events.lock().unwrap().take().unwrap();
+
+        let sent = data.clone();
+        let phone = std::thread::spawn(move || {
+            let link = weave::fake::Central::connect(tx, indications, 185);
+            let me = EndpointInfo {
+                kind: DeviceKind::Phone,
+                name: Some("Galaxy S24".into()),
+            };
+            let no = AtomicBool::new(false);
+            let crate::quickshare::Step::Next(mut conn) = outbound::connect_link(link, &me, *b"PHON", &no, |_| {}).unwrap() else {
+                panic!("handshake ended early");
+            };
+            let intro = crate::quickshare::proto::sharing::IntroductionFrame {
+                file_metadata: vec![crate::quickshare::proto::sharing::FileMetadata {
+                    name: Some("clip.bin".into()),
+                    payload_id: Some(3),
+                    size: Some(sent.len() as i64),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            conn.send_sharing(&crate::quickshare::sharing_frame(crate::quickshare::proto::sharing::V1Frame {
+                r#type: Some(crate::quickshare::proto::sharing::v1_frame::FrameType::Introduction as i32),
+                introduction: Some(intro),
+                ..Default::default()
+            }))
+            .unwrap();
+            assert_eq!(outbound::await_response(&mut conn, &no).unwrap(), crate::quickshare::Step::Next(()));
+            let total = sent.len() as i64;
+            let half = sent.len() / 2;
+            conn.send_file_chunk(3, total, 0, &sent[..half], false).unwrap();
+            let over_tcp = bwu::fake::respond(&mut conn, "PHON");
+            conn.send_file_chunk(3, total, half as i64, &sent[half..], false).unwrap();
+            conn.send_file_chunk(3, total, total, &[], true).unwrap();
+            while conn.recv(Duration::from_secs(5)).unwrap() != Some(crate::quickshare::conn::Incoming::Disconnected) {}
+            over_tcp.load(Ordering::SeqCst)
+        });
+
+        let inc = next(&r.lines, "incoming");
+        assert_eq!(
+            (&inc["device"], &inc["kind"], &inc["total"]),
+            (&json!("Galaxy S24"), &json!("phone"), &json!(200 * 1024))
+        );
+        let id = inc["id"].clone();
+        let waiting = next(&r.lines, "transfer");
+        assert_eq!(
+            (&waiting["id"], &waiting["direction"], &waiting["state"]),
+            (&id, &json!("in"), &json!("waiting"))
+        );
+        r.tx.send(Msg::Cmd(Cmd::Accept {
+            id: id.as_u64().unwrap(),
+            dir: dest.path().to_str().unwrap().into(),
+        }))
+        .unwrap();
+        let done = finished(&r.lines, &id);
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(fs::read(dest.path().join("clip.bin")).unwrap(), data);
+        assert!(phone.join().unwrap() > data.len() / 2, "the second half came over TCP");
+
+        r.tx.send(Msg::Eof).unwrap();
+        r.thread.join().unwrap().unwrap();
     }
 
     #[test]

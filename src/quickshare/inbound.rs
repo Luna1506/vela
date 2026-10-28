@@ -1,6 +1,8 @@
 //! Receiving files and text: the other device is the client, we are the
 //! server. ConnectionRequest → UKEY2 → ConnectionResponse → paired key
-//! frames → Introduction → the user decides → Response → payloads.
+//! frames → Introduction → the user decides → Response → payloads. Over
+//! Bluetooth, an accepted transfer is offered to go on over Wi-Fi LAN
+//! ([`bwu`]).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -12,9 +14,11 @@ use std::sync::mpsc::{self, TryRecvError};
 
 use anyhow::{Context, bail};
 
-use super::conn::{Conn, Incoming};
+use super::bwu;
+use super::conn::{Conn, Incoming, Link};
 use super::endpoint::{DeviceKind, EndpointInfo};
 use super::files::{self, Partial};
+use super::proto::connections::connection_request_frame::Medium;
 use super::proto::connections::{V1Frame, v1_frame};
 use super::proto::sharing;
 use super::proto::sharing::connection_response_frame::Status;
@@ -29,6 +33,8 @@ use super::{
 thread_local! {
     /// Test seam: the free space `handle` sees, instead of the real one.
     static FREE_SPACE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Test seam: the tests' receiver runs `handle_link` instead of `handle`.
+    static VIA_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs one incoming connection. Announces the offer as `Incoming` and then
@@ -39,12 +45,75 @@ thread_local! {
 /// `Finished(Failed)`.
 pub fn handle(stream: TcpStream, id: u64, events: mpsc::Sender<Event>, decisions: mpsc::Receiver<Decision>, cancel: Arc<AtomicBool>) -> anyhow::Result<()> {
     prepare(&stream)?;
-    let (device, kind) = sender_of(&read_plain(&stream)?)?;
-    let keys = ukey2::server(&mut &stream, &mut &stream)?;
-    check_connection_response(&read_plain(&stream)?)?;
-    write_plain(&stream, connection_response())?;
+    handle_link(stream, id, events, decisions, cancel, None)
+}
 
-    let mut conn = Conn::new(Box::new(stream), &keys)?;
+/// [`handle`] for serve's port, where a phone that moves a Bluetooth
+/// transfer to Wi-Fi LAN connects too: its connection (the first frame is a
+/// CLIENT_INTRODUCTION) goes to the waiting session through `rendezvous`.
+pub fn handle_tcp(
+    stream: TcpStream,
+    id: u64,
+    events: mpsc::Sender<Event>,
+    decisions: mpsc::Receiver<Decision>,
+    cancel: Arc<AtomicBool>,
+    rendezvous: &bwu::Rendezvous,
+) -> anyhow::Result<()> {
+    prepare(&stream)?;
+    let first = read_plain(&stream)?;
+    if let Some(ids) = bwu::client_introduction(&first) {
+        if !rendezvous.hand_over(&ids, stream)? {
+            log::info!("quickshare: {ids:?} wants to go on over Wi-Fi, but no transfer of it is waiting for that");
+        }
+        return Ok(());
+    }
+    session(stream, &first, id, events, decisions, cancel, None)
+}
+
+/// [`handle`] over any link (Bluetooth: a [`WeaveLink`](super::weave::WeaveLink)).
+/// With `upgrade`, an accepted transfer of files is offered to go on over
+/// Wi-Fi LAN; it finishes over `link` if the phone does not come.
+pub fn handle_link(
+    mut link: impl Link,
+    id: u64,
+    events: mpsc::Sender<Event>,
+    decisions: mpsc::Receiver<Decision>,
+    cancel: Arc<AtomicBool>,
+    upgrade: Option<bwu::Offer>,
+) -> anyhow::Result<()> {
+    let first = read_plain(&mut link)?;
+    session(link, &first, id, events, decisions, cancel, upgrade)
+}
+
+/// Everything after the ConnectionRequest `request`.
+fn session(
+    mut link: impl Link,
+    request: &V1Frame,
+    id: u64,
+    events: mpsc::Sender<Event>,
+    decisions: mpsc::Receiver<Decision>,
+    cancel: Arc<AtomicBool>,
+    upgrade: Option<bwu::Offer>,
+) -> anyhow::Result<()> {
+    let Peer {
+        device,
+        kind,
+        endpoint,
+        wifi_lan,
+    } = sender_of(request)?;
+    let mut reader = link.reader()?;
+    let keys = ukey2::server(&mut reader, &mut link)?;
+    check_connection_response(&read_plain(&mut reader)?)?;
+    write_plain(&mut link, connection_response())?;
+    drop(reader);
+    let upgrade = upgrade.filter(|_| {
+        if !wifi_lan {
+            log::info!("quickshare: {device} cannot go on over Wi-Fi LAN");
+        }
+        wifi_lan
+    });
+
+    let mut conn = Conn::new(Box::new(link), &keys)?;
     conn.send_sharing(&paired_key_encryption())?;
     let intro = match introduction(&mut conn, &cancel)? {
         Step::Next(intro) => intro,
@@ -77,7 +146,8 @@ pub fn handle(stream: TcpStream, id: u64, events: mpsc::Sender<Event>, decisions
         total: plan.total,
     }));
     let mut saved = Vec::new();
-    let result = receive(&mut conn, &plan, id, &events, &decisions, &cancel, &mut saved);
+    let upgrade = upgrade.as_ref().map(|offer| (offer, endpoint.as_str()));
+    let result = receive(&mut conn, &plan, id, &events, &decisions, &cancel, &mut saved, upgrade);
     let outcome = match &result {
         Ok(outcome) => outcome.clone(),
         Err(e) => {
@@ -90,17 +160,32 @@ pub fn handle(stream: TcpStream, id: u64, events: mpsc::Sender<Event>, decisions
     result.map(drop)
 }
 
-/// Name and kind from the ConnectionRequest's endpoint info, else its
-/// endpoint name.
-fn sender_of(request: &V1Frame) -> anyhow::Result<(String, DeviceKind)> {
+/// Who sends, from the ConnectionRequest.
+struct Peer {
+    /// From the endpoint info, else the endpoint name.
+    device: String,
+    kind: DeviceKind,
+    endpoint: String,
+    /// Wi-Fi LAN is among the mediums it can move to (or it names none).
+    wifi_lan: bool,
+}
+
+fn sender_of(request: &V1Frame) -> anyhow::Result<Peer> {
     if request.r#type() != v1_frame::FrameType::ConnectionRequest {
         bail!("expected a ConnectionRequest, got {}", request.r#type().as_str_name());
     }
     let request = request.connection_request.as_ref().context("ConnectionRequest without content")?;
     let info = request.endpoint_info.as_deref().and_then(EndpointInfo::decode);
     let kind = info.as_ref().map_or(DeviceKind::Unknown, |i| i.kind);
-    let name = info.and_then(|i| i.name).or_else(|| request.endpoint_name.clone()).unwrap_or_default();
-    Ok((name, kind))
+    let device = info.and_then(|i| i.name).or_else(|| request.endpoint_name.clone()).unwrap_or_default();
+    let mediums: Vec<&str> = request.mediums().map(|m| m.as_str_name()).collect();
+    log::debug!("quickshare: {device} can move to {mediums:?}");
+    Ok(Peer {
+        device,
+        kind,
+        endpoint: request.endpoint_id().to_owned(),
+        wifi_lan: request.mediums.is_empty() || request.mediums().any(|m| m == Medium::WifiLan),
+    })
 }
 
 /// Answers the paired key frames until the Introduction arrives.
@@ -189,7 +274,9 @@ impl Plan {
     }
 }
 
-/// From the offer to the end of the transfer.
+/// From the offer to the end of the transfer. With `upgrade` (the offer and
+/// the phone's endpoint id), files go on over Wi-Fi LAN if the phone can.
+#[allow(clippy::too_many_arguments)]
 fn receive(
     conn: &mut Conn,
     plan: &Plan,
@@ -198,6 +285,7 @@ fn receive(
     decisions: &mpsc::Receiver<Decision>,
     cancel: &AtomicBool,
     saved: &mut Vec<PathBuf>,
+    upgrade: Option<(&bwu::Offer, &str)>,
 ) -> anyhow::Result<Outcome> {
     let dir = match decide(conn, decisions, cancel)? {
         Step::Next(dir) => dir,
@@ -214,7 +302,21 @@ fn receive(
         conn.expect_bytes(text.payload_id);
     }
     conn.send_sharing(&response(Status::Accept))?;
-    transfer(conn, files, plan.text.as_ref(), Progress::new(id, plan.total), events, cancel, saved)
+    // Text alone is done before an upgrade could be.
+    let mut upgrade = match upgrade {
+        Some((offer, endpoint)) if !plan.files.is_empty() => bwu::Upgrade::start(conn, offer, endpoint)?,
+        _ => None,
+    };
+    transfer(
+        conn,
+        files,
+        plan.text.as_ref(),
+        Progress::new(id, plan.total),
+        events,
+        cancel,
+        saved,
+        &mut upgrade,
+    )
 }
 
 /// Waits for the user while keeping the connection alive. A dropped
@@ -309,8 +411,10 @@ fn open_files(dir: &Path, plan: &Plan) -> Result<HashMap<i64, Receiving>, (Statu
     Ok(out)
 }
 
-/// Writes the file chunks and collects the text until everything is in.
-/// Unfinished partial files are deleted when this returns.
+/// Writes the file chunks and collects the text until everything is in,
+/// meanwhile moving to Wi-Fi LAN when `upgrade` gets there. Unfinished
+/// partial files are deleted when this returns.
+#[allow(clippy::too_many_arguments)]
 fn transfer(
     conn: &mut Conn,
     mut files: HashMap<i64, Receiving>,
@@ -319,6 +423,7 @@ fn transfer(
     events: &mpsc::Sender<Event>,
     cancel: &AtomicBool,
     saved: &mut Vec<PathBuf>,
+    upgrade: &mut Option<bwu::Upgrade>,
 ) -> anyhow::Result<Outcome> {
     let mut text = text;
     let id = progress.id;
@@ -326,6 +431,9 @@ fn transfer(
         if cancel.load(Ordering::SeqCst) {
             send_cancel(conn);
             return Ok(Outcome::Cancelled);
+        }
+        if let Some(u) = upgrade {
+            u.poll(conn)?;
         }
         match conn.recv(POLL)? {
             Some(Incoming::FileChunk {
@@ -355,6 +463,11 @@ fn transfer(
             }
             Some(Incoming::Sharing(f)) if is_cancel(&f) => return Ok(Outcome::Cancelled),
             Some(Incoming::PayloadCancelled { .. } | Incoming::Disconnected) => return Ok(Outcome::Cancelled),
+            Some(Incoming::Upgrade(f)) => {
+                if let Some(u) = upgrade {
+                    u.on_frame(&f);
+                }
+            }
             Some(Incoming::Sharing(_)) | None => {}
         }
     }
@@ -390,8 +503,9 @@ mod tests {
         thread: JoinHandle<anyhow::Result<()>>,
     }
 
-    /// `handle` on the first connection to a fresh listener, with `free`
-    /// overriding the free space of the target folder.
+    /// `handle` (or `handle_link`, see [`VIA_LINK`]) on the first
+    /// connection to a fresh listener, with `free` overriding the free space
+    /// of the target folder.
     fn receiver(free: Option<u64>) -> Receiver {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -399,10 +513,15 @@ mod tests {
         let (decisions, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
+        let via_link = VIA_LINK.get();
         let thread = thread::spawn(move || {
             FREE_SPACE.set(free);
             let (stream, _) = listener.accept()?;
-            handle(stream, RECEIVE_ID, tx, rx, c)
+            if via_link {
+                handle_link(stream, RECEIVE_ID, tx, rx, c, None)
+            } else {
+                handle(stream, RECEIVE_ID, tx, rx, c)
+            }
         });
         Receiver {
             addr,
@@ -785,5 +904,19 @@ mod tests {
         assert!(entries(dest.path()).is_empty());
         drop(conn);
         assert!(join(r.thread).is_err());
+    }
+
+    #[test]
+    fn the_same_through_handle_link() {
+        VIA_LINK.set(true);
+        loopback_transfer_is_byte_identical();
+        reject_reaches_sender();
+        hostile_names_stay_inside();
+        disconnect_mid_transfer_leaves_no_files();
+        not_enough_space_is_reported();
+        wifi_credentials_are_rejected();
+        text_arrives_as_an_event();
+        cancel_while_deciding_reaches_sender();
+        more_bytes_than_announced_fail_and_leave_nothing();
     }
 }

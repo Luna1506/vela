@@ -1,9 +1,10 @@
-//! Quick Share (Nearby Share over Wi-Fi LAN): protocol types and framing, and
-//! the two roles on top of them, receiving ([`inbound`]) and sending
-//! ([`outbound`]).
+//! Quick Share (Nearby Share over Wi-Fi LAN, receiving also over Bluetooth
+//! LE): protocol types and framing, and the two roles on top of them,
+//! receiving ([`inbound`]) and sending ([`outbound`]).
 
 pub mod ble;
 pub mod blead;
+pub mod bwu;
 pub mod conn;
 pub mod desktop;
 pub mod endpoint;
@@ -17,8 +18,9 @@ pub mod proto;
 pub mod secure;
 pub mod serve;
 pub mod ukey2;
+pub mod weave;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -142,20 +144,20 @@ fn prepare(stream: &TcpStream) -> io::Result<()> {
 }
 
 /// Writes a plaintext `OfflineFrame` (length prefix and message in one write).
-fn write_plain(mut stream: &TcpStream, v1: proto::connections::V1Frame) -> io::Result<()> {
+fn write_plain(mut w: impl Write, v1: proto::connections::V1Frame) -> io::Result<()> {
     let frame = OfflineFrame {
         version: Some(offline_frame::Version::V1 as i32),
         v1: Some(v1),
     };
     let mut buf = Vec::new();
     write_frame(&mut buf, &frame.encode_to_vec())?;
-    stream.write_all(&buf)
+    w.write_all(&buf)
 }
 
-/// Reads a plaintext `OfflineFrame` straight off the socket: nothing is
+/// Reads a plaintext `OfflineFrame` straight off the link: nothing is
 /// buffered, so the encrypted frames after it are left for [`Conn`].
-fn read_plain(mut stream: &TcpStream) -> anyhow::Result<proto::connections::V1Frame> {
-    let frame = read_frame(&mut stream).context("reading a plaintext frame")?;
+fn read_plain(mut r: impl Read) -> anyhow::Result<proto::connections::V1Frame> {
+    let frame = read_frame(&mut r).context("reading a plaintext frame")?;
     let frame = OfflineFrame::decode(frame.as_slice()).context("decoding OfflineFrame")?;
     frame.v1.context("OfflineFrame without v1")
 }

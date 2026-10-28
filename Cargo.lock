@@ -2218,6 +2218,7 @@ dependencies = [
  "gtk4-layer-shell",
  "hkdf",
  "hmac",
+ "if-addrs",
  "ignore",
  "libadwaita",
  "libc",
