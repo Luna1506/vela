@@ -178,6 +178,7 @@ fn sender_of(request: &V1Frame) -> anyhow::Result<Peer> {
     let info = request.endpoint_info.as_deref().and_then(EndpointInfo::decode);
     let kind = info.as_ref().map_or(DeviceKind::Unknown, |i| i.kind);
     let device = info.and_then(|i| i.name).or_else(|| request.endpoint_name.clone()).unwrap_or_default();
+    let device = files::display(&device, MAX_DEVICE_CHARS);
     let mediums: Vec<&str> = request.mediums().map(|m| m.as_str_name()).collect();
     log::debug!("quickshare: {device} can move to {mediums:?}");
     Ok(Peer {
@@ -207,6 +208,12 @@ fn introduction(conn: &mut Conn, cancel: &AtomicBool) -> anyhow::Result<Step<sha
     }
 }
 
+/// Most files one offer may announce; more are not supported.
+pub const MAX_FILES: usize = 1000;
+/// Longest device name, file name and text title shown, in characters.
+pub const MAX_DEVICE_CHARS: usize = 64;
+pub const MAX_TITLE_CHARS: usize = 256;
+
 /// What an introduction announces, checked.
 struct Plan {
     files: Vec<PlannedFile>,
@@ -230,6 +237,10 @@ impl Plan {
     /// texts, nothing at all, broken metadata) is not supported.
     fn new(intro: sharing::IntroductionFrame) -> Option<Plan> {
         if !intro.app_metadata.is_empty() || !intro.stream_metadata.is_empty() || intro.text_metadata.len() > 1 {
+            return None;
+        }
+        if intro.file_metadata.len() > MAX_FILES {
+            log::warn!("quickshare: offer of {} files refused (limit {MAX_FILES})", intro.file_metadata.len());
             return None;
         }
         let mut ids = HashSet::new();
@@ -258,7 +269,7 @@ impl Plan {
                 if !ids.insert(payload_id) {
                     return None;
                 }
-                let title = t.text_title().to_owned();
+                let title = files::display(t.text_title(), MAX_TITLE_CHARS);
                 let (kind, offer) = match t.r#type() {
                     TextType::Text => ("text", OfferText::Text(title)),
                     TextType::Url => ("url", OfferText::Url(title)),
@@ -823,6 +834,43 @@ mod tests {
         assert!(entries(dest.path()).is_empty());
         join(s.thread).unwrap();
         join(r.thread).unwrap();
+    }
+
+    fn numbered_file(i: i64, name: &str) -> sharing::FileMetadata {
+        sharing::FileMetadata {
+            name: Some(name.into()),
+            size: Some(1),
+            payload_id: Some(i),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_offer_of_too_many_files_is_not_supported() {
+        let many = |n: usize| files_intro((0..n as i64).map(|i| numbered_file(i + 1, "a.txt")).collect());
+        assert_eq!(Plan::new(many(MAX_FILES)).map(|p| p.files.len()), Some(MAX_FILES));
+        assert!(Plan::new(many(MAX_FILES + 1)).is_none());
+    }
+
+    #[test]
+    fn long_titles_and_spoofed_names_are_cut_down() {
+        let intro = sharing::IntroductionFrame {
+            file_metadata: vec![numbered_file(1, "photo\u{202E}gpj.exe")],
+            text_metadata: vec![sharing::TextMetadata {
+                text_title: Some("ü".repeat(10_000)),
+                r#type: Some(sharing::text_metadata::Type::Text as i32),
+                payload_id: Some(2),
+                size: Some(1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = Plan::new(intro).unwrap();
+        assert_eq!(plan.files[0].offer.name, "photogpj.exe");
+        match plan.text.unwrap().offer {
+            OfferText::Text(t) => assert_eq!(t.chars().count(), MAX_TITLE_CHARS + 1),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

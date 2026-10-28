@@ -171,16 +171,29 @@ fn state_of(outcome: &Outcome) -> (&'static str, String) {
     }
 }
 
+/// Concurrent incoming connections (TCP and Bluetooth); more are closed.
+const MAX_CONNECTIONS: usize = 8;
+/// Offers waiting for the user at once; more are rejected.
+const MAX_PENDING_OFFERS: usize = 3;
+
+/// The offer as a line for the shell; what the other device chose (names,
+/// titles, how many files) is bounded here again, whatever the sender did.
 fn incoming_line(offer: &Offer) -> Value {
+    let title = |t: &str| files::display(t, inbound::MAX_TITLE_CHARS);
     let text = offer.text.as_ref().map(|t| match t {
-        OfferText::Url(title) => json!({ "kind": "url", "title": title }),
-        OfferText::Text(title) | OfferText::Other(title) => json!({ "kind": "text", "title": title }),
+        OfferText::Url(t) => json!({ "kind": "url", "title": title(t) }),
+        OfferText::Text(t) | OfferText::Other(t) => json!({ "kind": "text", "title": title(t) }),
     });
-    let files: Vec<Value> = offer.files.iter().map(|f| json!({ "name": f.name, "size": f.size, "mime": f.mime })).collect();
+    let files: Vec<Value> = offer
+        .files
+        .iter()
+        .take(inbound::MAX_FILES)
+        .map(|f| json!({ "name": title(&f.name), "size": f.size, "mime": files::display(&f.mime, inbound::MAX_DEVICE_CHARS) }))
+        .collect();
     json!({
         "type": "incoming",
         "id": offer.id,
-        "device": offer.device,
+        "device": files::display(&offer.device, inbound::MAX_DEVICE_CHARS),
         "kind": offer.kind.id(),
         "pin": offer.pin,
         "files": files,
@@ -790,9 +803,26 @@ impl<'a, W: Write> Server<'a, W> {
         Ok((cancel, thread))
     }
 
+    /// Incoming connections that have not ended yet.
+    fn connections(&self) -> usize {
+        self.transfers.values().filter(|t| t.direction == "in").count()
+    }
+
+    /// Offers shown to the user and not decided yet.
+    fn pending_offers(&self) -> usize {
+        self.transfers
+            .values()
+            .filter(|t| t.direction == "in" && t.announced && t.decisions.is_some())
+            .count()
+    }
+
     fn incoming(&mut self, stream: TcpStream) {
-        let id = self.next_id();
         let from = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+        if self.connections() >= MAX_CONNECTIONS {
+            log::warn!("quickshare: {MAX_CONNECTIONS} connections already, closing the one from {from}");
+            return;
+        }
+        let id = self.next_id();
         log::info!("quickshare: connection {id} from {from}");
         let rendezvous = self.rendezvous.clone();
         self.receive(id, move |events, decisions, cancel| {
@@ -803,6 +833,10 @@ impl<'a, W: Write> Server<'a, W> {
     /// Like [`Server::incoming`], over Bluetooth; an accepted transfer is
     /// offered to go on over Wi-Fi to our port.
     fn incoming_ble(&mut self, link: weave::WeaveLink) {
+        if self.connections() >= MAX_CONNECTIONS {
+            log::warn!("quickshare: {MAX_CONNECTIONS} connections already, closing the one over Bluetooth");
+            return;
+        }
         let id = self.next_id();
         log::info!("quickshare: connection {id} over Bluetooth");
         let offer = bwu::Offer {
@@ -891,6 +925,17 @@ impl<'a, W: Write> Server<'a, W> {
     fn event(&mut self, e: Event) {
         let line = match e {
             Event::Incoming(offer) => {
+                if self.pending_offers() >= MAX_PENDING_OFFERS {
+                    log::warn!(
+                        "quickshare: {MAX_PENDING_OFFERS} offers already wait, rejecting {} from {:?}",
+                        offer.id,
+                        offer.device
+                    );
+                    if let Some(decide) = self.transfers.get_mut(&offer.id).and_then(|t| t.decisions.take()) {
+                        let _ = decide.send(Decision::Reject);
+                    }
+                    return;
+                }
                 let Some(t) = self.transfers.get_mut(&offer.id) else { return };
                 log::info!(
                     "quickshare: {} offers {} file(s) as {}, PIN {}",
@@ -1528,6 +1573,81 @@ mod tests {
         assert_eq!(finished(&r.lines, &b)["state"], "cancelled");
         r.thread.join().unwrap().unwrap();
         assert_eq!(outcome(second), Outcome::Cancelled);
+    }
+
+    #[test]
+    fn connections_beyond_the_limit_are_closed_at_once() {
+        let r = start(0);
+        let addr = hello(&r);
+        let idle: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        let mut extra = TcpStream::connect(addr).unwrap();
+        extra.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut buf = [0u8; 1];
+        // Closed by the server: end of stream (or a reset), not a timeout.
+        match extra.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("the extra connection was kept: {other:?}"),
+        }
+        // The ones inside the limit stay open.
+        let mut first = idle.first().unwrap().try_clone().unwrap();
+        first.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        assert_eq!(first.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(idle);
+        r.tx.send(Msg::Stop).unwrap();
+        r.thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn offers_beyond_the_pending_limit_are_rejected_without_a_window() {
+        let src = tempfile::tempdir().unwrap();
+        let file = src.path().join("a.txt");
+        fs::write(&file, b"hello").unwrap();
+        let r = start(0);
+        let addr = hello(&r);
+
+        let waiting: Vec<Peer> = (0..MAX_PENDING_OFFERS)
+            .map(|_| {
+                let p = phone(addr, std::slice::from_ref(&file));
+                next(&r.lines, "incoming");
+                p
+            })
+            .collect();
+        let extra = phone(addr, std::slice::from_ref(&file));
+        assert_eq!(outcome(extra), Outcome::Rejected);
+        while let Ok(line) = r.lines.try_recv() {
+            assert_ne!(line["type"], "incoming", "{line}");
+        }
+
+        r.tx.send(Msg::Stop).unwrap();
+        r.thread.join().unwrap().unwrap();
+        for p in waiting {
+            assert_eq!(outcome(p), Outcome::Cancelled);
+        }
+    }
+
+    #[test]
+    fn the_offer_line_is_bounded() {
+        use crate::quickshare::OfferFile;
+        let offer = Offer {
+            id: 1,
+            device: "d".repeat(500),
+            kind: DeviceKind::Phone,
+            pin: "1234".into(),
+            files: vec![OfferFile {
+                name: "n\u{202E}".repeat(500),
+                size: 1,
+                mime: String::new(),
+            }],
+            text: Some(OfferText::Text("t".repeat(5000))),
+            total: 1,
+        };
+        let line = incoming_line(&offer);
+        assert_eq!(line["device"].as_str().unwrap().chars().count(), inbound::MAX_DEVICE_CHARS + 1);
+        let name = line["files"][0]["name"].as_str().unwrap();
+        assert!(!name.contains('\u{202E}') && name.chars().count() == inbound::MAX_TITLE_CHARS + 1);
+        assert_eq!(line["text"]["title"].as_str().unwrap().chars().count(), inbound::MAX_TITLE_CHARS + 1);
     }
 
     #[test]

@@ -226,8 +226,8 @@ ShellRoot {
         check(off !== null && off.page === null, "Quick Share off shows no tab");
     }
 
-    // The hint about "Share with Apple devices" only while phones searching
-    // over Bluetooth can't find this PC (`bleReceive` from `hello`).
+    // The hint about "Share with Apple devices" is shown whatever
+    // `bleReceive` from `hello` says; the property still follows `hello`.
     function receiveHint(): void {
         const page = create("details/QuickShareReceive", {});
         const hint = page ? findChild(page, "appleHint") : null;
@@ -242,7 +242,7 @@ ShellRoot {
                 bleReceive: on
             }));
             check(QuickShare.bleReceive === on, "hello sets bleReceive " + on);
-            check(hint?.visible === !on, "hint shown " + hint?.visible + " with bleReceive " + on);
+            check(hint?.visible === true, "hint shown " + hint?.visible + " with bleReceive " + on);
         }
         // A backend that is gone leaves no Bluetooth state behind.
         QuickShare.apply(JSON.stringify({

@@ -18,13 +18,39 @@ const PART_SUFFIX: &str = ".vela-part";
 /// How often a name collision is retried before giving up.
 const MAX_TRIES: u32 = 1000;
 
+/// Characters without a glyph of their own that can reorder or hide text
+/// (bidi overrides like U+202E turn `photo<U+202E>gpj.exe` into
+/// `photoexe.jpg` on screen): zero-width and bidi marks, isolates, word
+/// joiner and invisible operators, the BOM, soft hyphen, Arabic letter mark,
+/// Mongolian vowel separator, interlinear annotation marks.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+/// Text from the other device for showing: control and invisible formatting
+/// characters dropped, at most `max` characters (cut on a character
+/// boundary, `…` at the cut).
+pub fn display(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (n, c) in text.chars().filter(|c| !c.is_control() && !is_invisible(*c)).enumerate() {
+        if n == max {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Turns a name sent by the other device into a plain file name: only the
-/// part after the last `/` or `\`, no control characters, trimmed, at most
+/// part after the last `/` or `\`, no control or invisible formatting characters, trimmed, at most
 /// 255 bytes with the extension kept. Leading dots stay (`.bashrc`); empty,
 /// `.` and `..` become `file`.
 pub fn sanitize(name: &str) -> String {
     let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let clean: String = last.chars().filter(|c| !c.is_control()).collect();
+    let clean: String = last.chars().filter(|c| !c.is_control() && !is_invisible(*c)).collect();
     let clean = clean.trim();
     if clean.is_empty() || clean == "." || clean == ".." {
         return "file".into();
@@ -274,6 +300,22 @@ mod tests {
         let mut v: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn sanitize_drops_bidi_and_invisible_characters() {
+        assert_eq!(sanitize("photo\u{202E}gpj.exe"), "photogpj.exe");
+        assert_eq!(sanitize("a\u{200B}b\u{200F}c\u{2066}d\u{2069}e\u{FEFF}.txt"), "abcde.txt");
+        assert_eq!(sanitize("\u{202E}\u{202A}"), "file");
+    }
+
+    #[test]
+    fn display_cuts_on_a_char_boundary_and_drops_invisible_characters() {
+        assert_eq!(display("short", 64), "short");
+        assert_eq!(display("photo\u{202E}gpj.exe", 64), "photogpj.exe");
+        assert_eq!(display("ääää", 4), "ääää");
+        assert_eq!(display("äääää", 4), "ääää…");
+        assert_eq!(display(&"😀".repeat(300), 256).chars().count(), 257);
     }
 
     #[test]

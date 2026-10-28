@@ -277,11 +277,17 @@ fn escape_markup(text: &str) -> String {
     out
 }
 
+/// Summary and body as sent: the summary is plain text in the notification
+/// spec, only the body takes markup.
+fn notification_text(summary: &str, body: &str) -> (String, String) {
+    (summary.to_owned(), escape_markup(body))
+}
+
 /// Shows a notification; `action` is a button (and the click on the
 /// notification) that opens the URI. Bounded by [`CALL_TIMEOUT`].
 pub fn notify(summary: &str, body: &str, action: Option<(&str, String)>) -> anyhow::Result<()> {
     let conn = notification_bus()?;
-    let (summary, body) = (escape_markup(summary), escape_markup(body));
+    let (summary, body) = notification_text(summary, body);
     let actions: Vec<&str> = action.iter().flat_map(|(label, _)| ["default", *label]).collect();
     let hints: HashMap<&str, Value<'_>> = HashMap::new();
     let reply = conn
@@ -546,6 +552,13 @@ mod tests {
         assert_eq!(path_from_uri("file:///a%+fb"), Some(PathBuf::from("/a%+fb")));
         assert_eq!(path_from_uri("file:///a%aéb"), Some(PathBuf::from("/a%aéb")));
         assert_eq!(file_uri("/a b"), "file:///a%20b");
+    }
+
+    #[test]
+    fn only_the_body_of_a_notification_is_escaped() {
+        let (summary, body) = notification_text("A & B <sent>", "A & B <sent>");
+        assert_eq!(summary, "A & B <sent>");
+        assert_eq!(body, "A &amp; B &lt;sent&gt;");
     }
 
     #[test]

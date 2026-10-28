@@ -123,11 +123,10 @@ ColumnLayout {
         wrapMode: Text.WordWrap
     }
 
-    // Only needed while phones searching over Bluetooth can't find us.
+    // Always shown: receiving with "Share with Apple devices" on is untested.
     StyledText {
         objectName: "appleHint"
         Layout.fillWidth: true
-        visible: !QuickShare.bleReceive
         text: I18n.tr("Phone doesn't find this PC? Turn off “Share with Apple devices” in Quick Share on the phone.")
         color: Theme.colors.textMuted
         font.pixelSize: Theme.font.small

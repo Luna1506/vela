@@ -165,7 +165,7 @@ Send and receive files, text and links with Android and Samsung phones nearby
 they are. A tile in the control center opens it: the *Receive* tab shows how
 this PC appears to phones, the *Send* tab lists the phones that are nearby.
 
-- **Network**: in this version the PC and the phone must be on the same Wi-Fi network, or the PC on the phone's hotspot.
+- **Network**: receiving works when the PC and the phone are on the same Wi-Fi network (or the PC is on the phone's hotspot). Phones can also connect to the PC over Bluetooth; the transfer then switches to Wi-Fi when the phone can reach the PC there. Sending to a phone needs the same Wi-Fi network.
 - **On the phone**: set Quick Share visibility to "Everyone" (German: "Alle") while you send to the PC or receive from it.
 - **Receiving**: a window asks about every offer. Nothing is accepted automatically. Check that the PIN shown on the PC matches the one on the phone, then choose the folder (the first one is your Downloads folder) and accept.
 - **Sending**: pick files in the *Send* tab, or run `vela quickshare send <files…>` (directories are not sent). Dolphin gets "Send with Quick Share" in the right-click menu (`share/kio/servicemenus/vela-quickshare.desktop`); other file managers may list "Quick Share" under "Open with", depending on how they treat hidden entries (`vela-quickshare.desktop`). `vela quickshare send` always works. Without a running control center the command prints an error.
@@ -191,7 +191,7 @@ The name phones see and the port are set in the `[quickshare]` section of
 
 Known limitations, found with a Samsung Galaxy S25 (One UI 9):
 
-- If *Share with Apple devices* is on in the phone's Quick Share settings, the phone looks for PCs over Bluetooth only.
+- If *Share with Apple devices* is on in the phone's Quick Share settings, the phone may not find the PC. Turning it off helps; receiving with it on has not been tested.
 - Some phones announce themselves without a name; vela then lists them as "Android phone".
 
 For phones that look for PCs over Bluetooth only, vela also advertises over
